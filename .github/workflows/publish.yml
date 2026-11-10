@@ -1,9 +1,13 @@
 name: Publish package
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
+    inputs:
+      publish_to_pypi:
+        description: Confirm publishing this package to PyPI
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -11,6 +15,7 @@ permissions:
 
 jobs:
   publish:
+    if: inputs.publish_to_pypi == true
     runs-on: ubuntu-latest
 
     steps:

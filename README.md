@@ -1,472 +1,79 @@
-# ssh-mcp
+# ssh-mcp-policy
 
-Give your AI coding agent access to remote machines through your local OpenSSH client. ssh-mcp lets agents run commands, transfer and edit files, keep interactive shells open, and create port forwards using your existing SSH config, keys, and credentials.
+简体中文 | [English](README.en.md)
 
-Run ssh-mcp on the machine where your MCP client runs. Your remote hosts only need SSH access and the usual command-line tools; you don't install an MCP server on them.
+这是 [slepp/ssh-mcp](https://github.com/slepp/ssh-mcp) 的策略增强 fork：保留原有 SSH、文件、会话和端口转发工具，另外将高风险操作拆成独立工具并要求单独审批。
 
-## Why ssh-mcp?
+## 本 fork 的调整
 
-- **Uses your local SSH** — host aliases, `~/.ssh/config`, `ProxyJump`, agent forwarding, and existing credentials all work naturally. No SSH libraries or key management.
-- **Native-feeling remote editing** — `ssh_view`/`ssh_create`/`ssh_edit`/`ssh_grep`/`ssh_glob` mirror the read/edit/search tools agents already use locally, so remote files can be read, searched, and edited exactly like local ones instead of through ad hoc `cat`/`sed`/`grep` commands.
-- **Persistent sessions** — agents can keep a shell open across multiple tool calls, just like a human would. A stable `session_name` lets an agent find the same session after a context reset, while the MCP server keeps running.
-- **Observable** — every session records a transcript and optionally launches a detached tmux viewer so you can watch what the agent is doing in real time.
-- **Permission-gatable** — port forwarding is a separate tool from command execution, so MCP clients can allow SSH access without allowing port forwards.
-- **Pure Python** — no third-party runtime dependencies. Uses Python 3.10+ and your system's OpenSSH tools.
+- `ssh_exec` 和普通会话会拦截常见 sudo、删除命令。
+- `ssh_sudo_exec` 只运行显式白名单中的绝对路径命令，使用 `sudo -n`，不会通过 MCP 传 sudo 密码。
+- `ssh_delete` 默认只预览；实际删除必须同时设置 `dry_run=false` 和 `confirm=true`，并受配置删除根目录约束。
+- 管理会话、会话 sudo 和固定终端按键分别提供工具，便于 MCP 客户端逐项询问。
+- `ssh_sync` 禁止 rsync 的 `--delete`，删除请走独立的 `ssh_delete` 工具。
 
-## Requirements
+这些策略是防护栏，不是 shell 沙箱。SSH 账号仍有它自身的远程权限；应使用受限账号，并在服务器端配置匹配的 `sudoers` 规则。
 
-- Python 3.10+ in a POSIX environment, such as macOS or Linux (interactive sessions and `tty` commands need a local PTY)
-- `ssh` and `scp` on PATH (or set `SSH_MCP_SSH_BIN` / `SSH_MCP_SCP_BIN`)
-- `rsync` locally and on the remote host — only needed for `ssh_sync`; set `SSH_MCP_RSYNC_BIN` to override the local executable
-- `grep` and `find` on the **remote** host — needed for `ssh_grep` / `ssh_glob` (present on effectively all POSIX systems)
-- `tmux` locally — optional, for live session observation
+## 环境要求
 
-## Check your SSH connection
+- Python 3.10+ 和 POSIX 环境；交互会话需要本地 PTY。
+- 本地 OpenSSH；`ssh_sync` 需要本地和远程 `rsync`；远程搜索需要 `grep`/`find`，删除路径校验需要 `realpath`。
 
-First, connect from the machine that will run ssh-mcp. Replace `my-server` with an SSH host alias or `user@hostname`:
+## 从 WSL 源码启动
+
+安装启动器：
 
 ```bash
-ssh my-server 'printf "connected\n"'
+mkdir -p ~/.local/bin
+install -m 700 /path/to/checkout/scripts/ssh-mcp-policy-openchamber ~/.local/bin/ssh-mcp-policy-openchamber
 ```
 
-Verify the host fingerprint if SSH asks, and make sure your key or SSH agent is ready. Start with a host and account whose access you are comfortable giving the agent. ssh-mcp uses that account's permissions for remote commands and file changes.
+在本地 MCP 客户端配置中设置以下环境变量，不要把机器专属值提交到仓库：
 
-## Installation
+- `SSH_MCP_POLICY_HOME`：WSL 中的源码目录。
+- `SSH_MCP_WINDOWS_SSH_CONFIG`：WSL 可访问的 Windows SSH 配置路径。
+- `SSH_MCP_ALIAS_REWRITES`：可选的主机别名映射，格式为逗号分隔的 `旧名=新名`。
 
-### With uv (recommended)
-
-With [uv installed](https://docs.astral.sh/uv/getting-started/installation/), your MCP client can launch ssh-mcp with:
-
-```bash
-uvx --from slepp-ssh-mcp ssh-mcp
-```
-
-This runs the `ssh-mcp` command from the `slepp-ssh-mcp` package. Running it directly waits for MCP requests on standard input; there is no interactive prompt.
-
-To install the command persistently:
-
-```bash
-uv tool install slepp-ssh-mcp
-```
-
-### With pip
-
-Use a virtual environment:
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install slepp-ssh-mcp
-```
-
-Set your client's `command` to the absolute path to `.venv/bin/ssh-mcp` and use an empty `args` array. This keeps the server available even when the client starts outside your shell.
-
-## Connect your MCP client
-
-The examples below use `uvx`. If it is not on your client's PATH, use its absolute path as `command`. Add entries to an existing configuration rather than replacing its other servers.
-
-### Claude Code
-
-```bash
-claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
-```
-
-Or commit a `.mcp.json` to share with your team:
+OpenCode 命令示例（请替换占位值）：
 
 ```json
 {
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
+  "mcp": {
+    "servers": {
+      "ssh-mcp": {
+        "type": "local",
+        "command": [
+          "wsl.exe", "-d", "<发行版>", "--exec", "env",
+          "SSH_MCP_POLICY_HOME=/源码目录",
+          "SSH_MCP_WINDOWS_SSH_CONFIG=/mnt/c/Users/<用户>/.ssh/config",
+          "SSH_MCP_ALIAS_REWRITES=old-gpu=gpu-wsl",
+          "/home/<用户>/.local/bin/ssh-mcp-policy-openchamber"
+        ]
+      }
     }
   }
 }
 ```
 
-### Codex CLI
+启动器只复制安全的 SSH 连接指令，不复制私钥或 `IdentityFile`。首次启动时会从 `config/policy.example.json` 创建 `~/.config/ssh-mcp-policy/policy.json`。
+
+## 安全默认值
+
+```json
+{
+  "delete_roots": ["~/projects/", "~/scratch/"],
+  "sudo_commands": []
+}
+```
+
+sudo 白名单默认留空。启用前，应明确指定命令，并在远程 `sudoers` 中设置同等范围。OpenCode 应将 `ssh-mcp` 工具设为 `ask`，不要添加宽泛的自动允许规则。
+
+## 测试
 
 ```bash
-codex mcp add ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
+uv run --extra test --with pytest python -m unittest discover -s tests -v
+python3 -m compileall -q src
+uv run --with build python -m build
 ```
 
-### GitHub Copilot CLI
-
-Add to `~/.copilot/mcp-config.json`:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
-      "tools": ["*"]
-    }
-  }
-}
-```
-
-Use `/mcp show ssh-mcp` in Copilot CLI to check the server and its tools. If you authenticate through an SSH agent, add its `SSH_AUTH_SOCK` value to this server's `env` object; Copilot CLI inherits `PATH` automatically, while other environment variables need explicit configuration. See the [Copilot CLI MCP guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) for tool selection and environment configuration.
-
-### VS Code with GitHub Copilot
-
-Create `.vscode/mcp.json` in your project, using VS Code's top-level `servers` key:
-
-```json
-{
-  "servers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
-    }
-  }
-}
-```
-
-Review the configuration before trusting the workspace. Run **MCP: List Servers** from the Command Palette to start `ssh-mcp`, then select its tools in Copilot's agent chat. For a user-wide configuration, run **MCP: Open User Configuration**. See the [VS Code MCP guide](https://code.visualstudio.com/docs/agent-customization/mcp-servers) for configuration options.
-
-### Generic MCP client
-
-Use a client that supports local stdio servers:
-
-- Command: `uvx`
-- Arguments: `--from`, `slepp-ssh-mcp`, `ssh-mcp` as three separate arguments
-
-For a persistent installation, use the absolute path to the `ssh-mcp` executable with no arguments. The client starts and stops the server process.
-
-## Try your first command
-
-Open your client's MCP tool list and confirm that `ssh_exec` is available. In Claude Code or a Codex session, use `/mcp`; in Copilot CLI, use `/mcp show ssh-mcp`; in VS Code, use **MCP: List Servers**. You can also check Codex's saved server configuration with `codex mcp list`.
-
-Ask your agent:
-
-> Use ssh-mcp to run `pwd` and `uname -a` on `my-server`.
-
-Replace `my-server` with the same target you checked earlier. The corresponding `ssh_exec` arguments are:
-
-```json
-{
-  "target": "my-server",
-  "command": "pwd && uname -a",
-  "timeout": 10
-}
-```
-
-The result includes `stdout`, `stderr`, `exit_code`, and `timed_out`. These examples show tool arguments; your MCP client supplies the JSON-RPC request around them.
-
-### If setup fails
-
-- **Server cannot start:** check that the client can find `uvx` (or your installed `ssh-mcp` executable) and that it runs in an environment with Python 3.10+.
-- **SSH fails or waits for authentication:** repeat the terminal SSH check using the same target and account. Make sure the client process can reach your SSH config, keys, and SSH agent (`SSH_AUTH_SOCK`).
-- **Tools are missing:** check the configuration file's top-level key, then reconnect or restart the server and select its tools in your client.
-
-## How it works
-
-ssh-mcp runs as a stdio process that your MCP client spawns. It receives JSON-RPC tool calls and translates them into local `ssh`/`scp`/`rsync` commands. Because it uses your local SSH binary, everything in your `~/.ssh/config` works — jump hosts, custom ports, key selection, `SSH_AUTH_SOCK`, proxy commands.
-
-There are five modes of operation:
-
-### One-off commands (`ssh_exec`)
-
-Run a command, get stdout/stderr/exit code back. Works like `ssh host 'command'`.
-
-```json
-{
-  "target": "prod-web01",
-  "command": "systemctl status nginx",
-  "timeout": 10
-}
-```
-
-Use `cwd` to set the working directory, `env` to export variables, and `tty: true` for commands that need a terminal (like `sudo` with a password prompt). Note that `tty` merges stdout and stderr.
-
-### Interactive sessions (`ssh_ensure_session` + `ssh_write_session` + `ssh_read_session`)
-
-For multi-step work, open a persistent shell. The agent writes commands and reads output just like typing in a terminal.
-
-**Start or reuse a session:**
-
-```json
-{
-  "target": "prod-web01",
-  "session_name": "deploy-api"
-}
-```
-
-Always use a descriptive `session_name`. It serves three purposes:
-1. The agent can find the same session across multiple tool calls
-2. The tmux observer window gets a human-readable name (e.g., `ssh-mcp-prod-web01-deploy-api`)
-3. Another conversation connected to the same running server can recover the session by name
-
-**Write a command:**
-
-```json
-{
-  "session_id": "a1b2c3d4e5f6",
-  "input": "cd /app && git pull\n",
-  "wait_seconds": 5
-}
-```
-
-Always include `\n` to press Enter. Use `\u0003` for Ctrl-C, `\u0004` for Ctrl-D. Set `wait_seconds` high enough for the command to produce output (default: 1 second).
-
-**Read more output:**
-
-```json
-{
-  "session_id": "a1b2c3d4e5f6",
-  "wait_seconds": 10
-}
-```
-
-Check `pending_output_chars` in the response — if non-zero, call again to drain the buffer.
-
-**Session lifecycle:**
-- Session names and IDs are scoped to the running MCP server and are lost when it restarts. Use `ssh_stop_session` and `ssh_stop_forward` to close sessions and forwards when finished.
-- `ssh_ensure_session` is idempotent — call it at the start of each step
-- Sessions auto-detect dead connections via SSH keepalive (~90 seconds)
-- Response includes `uptime_seconds`, `idle_seconds`, and `exit_reason` for health monitoring
-- Use `auto_close: true` for one-shot commands that should clean up when done
-- Exited sessions are pruned from memory after 1 hour (5 minutes for `auto_close`)
-- `cwd`, `env`, and `shell` only apply when creating a new session — they are ignored when reusing an existing one
-
-### File transfer (`ssh_scp`, `ssh_sync`)
-
-Copy files between local and remote machines.
-
-**scp** — simple file/directory copy:
-
-```json
-{
-  "target": "prod-web01",
-  "direction": "upload",
-  "sources": ["/local/path/app.tar.gz"],
-  "destination": "/tmp/"
-}
-```
-
-For `upload`, `sources` are local paths and `destination` is remote. For `download`, it's reversed. The `target` parameter specifies the host — don't include the host in `sources` or `destination`.
-
-**rsync** — incremental sync with `--delete` and `--exclude`:
-
-```json
-{
-  "target": "prod-web01",
-  "direction": "upload",
-  "source": "./dist/",
-  "destination": "/var/www/app/",
-  "delete": true,
-  "exclude": ["*.log", ".git"]
-}
-```
-
-### Remote file access (`ssh_view`, `ssh_create`, `ssh_edit`, `ssh_grep`, `ssh_glob`)
-
-These mirror the read/edit/search tools agents use locally, but operate on files on the remote host — so remote editing feels the same as local editing instead of composing `cat`/`sed`/`grep` by hand over `ssh_exec`.
-
-**`ssh_view`** — read a file or list a directory:
-
-```json
-{
-  "target": "prod-web01",
-  "path": "/etc/nginx/nginx.conf"
-}
-```
-
-Returns `content`, `size_bytes`, and `total_lines`. Content is truncated at 20KB by default — pass `view_range: [start, end]` (1-based, inclusive; `end: -1` means "to end of file") to page through large files, or `force_read_large_files: true` to read the whole thing anyway. If `path` is a directory, returns non-hidden entries up to 2 levels deep instead.
-
-**`ssh_create`** — write a brand-new remote file:
-
-```json
-{
-  "target": "prod-web01",
-  "path": "/etc/systemd/system/myapp.service",
-  "content": "[Unit]\nDescription=My app\n..."
-}
-```
-
-Fails if `path` already exists or its parent directory doesn't, exactly like the local file-creation tool.
-
-**`ssh_edit`** — exact string replacement in an existing file:
-
-```json
-{
-  "target": "prod-web01",
-  "path": "/etc/nginx/nginx.conf",
-  "edits": [
-    {"old_str": "worker_processes 1;", "new_str": "worker_processes auto;"}
-  ]
-}
-```
-
-Each `old_str` must match exactly one location in the file (as it stands after any earlier edits in the same call) — ambiguous or missing matches fail without writing anything. Pass multiple `{old_str, new_str}` entries in `edits` to batch several changes into one round trip instead of one SSH connection per edit.
-
-**`ssh_grep`** — search remote file contents:
-
-```json
-{
-  "target": "prod-web01",
-  "pattern": "ERROR|WARN",
-  "path": "/var/log/myapp",
-  "glob": "*.log",
-  "output_mode": "content"
-}
-```
-
-`output_mode` is `files_with_matches` (default), `content` (matching lines, with line numbers and optional `context`/`context_before`/`context_after`), or `count` (per-file match counts; files with zero matches are omitted). Backed by remote `grep`, preferring PCRE-like `-P` when available and falling back to POSIX extended regex otherwise. Always skips `.git`/`.hg`/`.svn`.
-
-**`ssh_glob`** — find remote files by name:
-
-```json
-{
-  "target": "prod-web01",
-  "pattern": "src/**/*.ts",
-  "path": "/srv/app"
-}
-```
-
-Supports `*`, `?`, `[seq]`/`[!seq]`, `{a,b}` alternation, and `**` (zero or more path segments). A path segment starting with `.` is only matched by a pattern segment that itself starts with `.`, matching classic Unix glob behavior.
-
-All five tools raise a `remote_file_error` (see [Tools reference](#tools-reference)) for problems like a missing path, a path that already exists, or an ambiguous/missing `edit` match — the on-the-wire outcome you'd expect from the equivalent local tool.
-
-### Port forwarding (`ssh_forward`)
-
-Create local or remote port forwards. This is a separate tool from `ssh_exec` so MCP clients can grant SSH access without granting port forwarding.
-
-**Local forward** — make a remote service reachable locally:
-
-```json
-{
-  "target": "prod-web01",
-  "direction": "local",
-  "local_port": 15432,
-  "remote_host": "prod-db.internal",
-  "remote_port": 5432
-}
-```
-
-This binds `localhost:15432` and tunnels it to `prod-db.internal:5432` through `prod-web01`.
-
-**Remote forward** — expose a local service on the remote host:
-
-```json
-{
-  "target": "prod-web01",
-  "direction": "remote",
-  "local_port": 3000,
-  "remote_host": "localhost",
-  "remote_port": 8080
-}
-```
-
-Forwards bind to `127.0.0.1` by default. Set `bind_address: "0.0.0.0"` to expose on all interfaces (use with caution).
-
-Use `ssh_list_forwards` to see active forwards and `ssh_stop_forward` to tear them down.
-
-## Watching sessions
-
-Every interactive session records a transcript to `~/.local/state/ssh-mcp/<session_id>/transcript.log`.
-
-By default, sessions also launch a detached tmux window so you can watch in real time. The tmux session name includes the target and session name for easy identification:
-
-```bash
-# List ssh-mcp tmux sessions
-tmux ls | grep ssh-mcp
-
-# Attach to watch
-tmux attach -t ssh-mcp-prod-web01-deploy-api
-```
-
-If you prefer not to use tmux, set `observer_mode: "transcript"` and tail the transcript file directly — the response includes an `observer_command` you can copy-paste.
-
-The tmux observer is tied to the session lifecycle: stopping a session closes its tmux window. The MCP server also cleans up tmux on shutdown.
-
-## Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SSH_MCP_SSH_BIN` | `ssh` | Path to the SSH client |
-| `SSH_MCP_SCP_BIN` | `scp` | Path to the SCP client |
-| `SSH_MCP_RSYNC_BIN` | `rsync` | Path to rsync |
-| `SSH_MCP_TMUX_BIN` | `tmux` | Path to tmux |
-| `SSH_MCP_STATE_DIR` | `~/.local/state/ssh-mcp` | Where transcripts are stored |
-
-## Security
-
-ssh-mcp is designed for single-developer use on your own machine. It runs SSH commands as your user with your credentials.
-
-**What's protected:**
-- Port forwarding flags (`-L`, `-R`, `-D`, `-W`) and dangerous SSH options (`ProxyCommand`, `LocalCommand`, `LocalForward`, `RemoteForward`, `DynamicForward`) are blocked in `extra_ssh_args`. The only way to create forwards is through the explicit `ssh_forward` tool, which MCP clients can permission-gate.
-- Transcript files are created with mode `0600` and the state directory with `0700`.
-- All command arguments use `shlex.quote()` to prevent shell injection. Subprocess calls use list arguments, never `shell=True`.
-- Environment variable names are validated against `^[A-Za-z_][A-Za-z0-9_]*$`.
-
-**What's not protected:**
-- An agent with `ssh_exec` access can run arbitrary commands on any host your SSH config can reach. The security boundary is SSH itself (keys, known_hosts).
-- Transcript files persist on disk after sessions end and may contain secrets (passwords typed at sudo prompts, API keys in output). Clean up `SSH_MCP_STATE_DIR` when you no longer need them.
-- The `shell` parameter lets agents choose any remote executable. This is by design — the tool is for remote execution.
-
-## Known limitations
-
-- **POSIX-only remotes** — `cwd`, `env`, and `shell` wrapping assumes a POSIX shell on the remote side. Windows SSH targets need commands written for their shell.
-- **PTY output** — interactive sessions use a PTY, so output includes terminal formatting (ANSI escape codes, command echo, line wrapping). This is intentional — it matches what a human would see.
-- **No multiplexing** — each `ssh_exec` call opens a new SSH connection. If your agent runs many rapid commands to the same host, consider using a session instead, or configure `ControlMaster` in your `~/.ssh/config`.
-- **Transcript growth** — transcripts grow without bound for long-running sessions. The response includes `transcript_size_bytes` so you can monitor this. Restart the session if it gets too large.
-- **Forward connections are standalone** — each `ssh_forward` opens its own SSH connection. Forwards are not tied to sessions.
-- **Remote file tools are text-oriented** — `ssh_view`/`ssh_create`/`ssh_edit` decode remote content as UTF-8 with `errors="replace"`; binary files may come back with stray replacement characters. They're built for source/config files, like their local counterparts.
-- **`ssh_edit` isn't fully atomic** — it reads the file, applies edits locally, then writes the result back in a second SSH round trip. A concurrent external write between the two round trips could be overwritten, same class of risk as editing any file that's being modified elsewhere.
-- **`ssh_grep` regex flavor depends on the remote** — it prefers PCRE-like `-P` (closer to what agents expect) when the remote `grep`/`ggrep` supports it, otherwise falls back to POSIX extended regex (`-E`), which lacks things like `\d`/`\w`/`\b`. `multiline` matching isn't supported.
-- **`ssh_glob`/`ssh_grep` list the whole subtree** — matching happens after enumerating files under `path` via remote `find`; scope `path` to something reasonable on very large trees.
-
-## Tools reference
-
-| Tool | Description |
-|------|-------------|
-| `ssh_exec` | Run a one-off remote command |
-| `ssh_scp` | Copy files via scp |
-| `ssh_sync` | Incremental sync via rsync |
-| `ssh_view` | Read a remote file (with paging) or list a remote directory |
-| `ssh_create` | Create a new remote file |
-| `ssh_edit` | Exact string replacement in an existing remote file |
-| `ssh_grep` | Search remote file contents |
-| `ssh_glob` | Find remote files by name pattern |
-| `ssh_start_session` | Start a new interactive session |
-| `ssh_ensure_session` | Reuse or start an interactive session (recommended) |
-| `ssh_read_session` | Read output from a session |
-| `ssh_write_session` | Write input to a session |
-| `ssh_stop_session` | Stop a session |
-| `ssh_list_sessions` | List tracked sessions |
-| `ssh_forward` | Start a port forward |
-| `ssh_list_forwards` | List tracked forwards |
-| `ssh_stop_forward` | Stop a port forward |
-
-All session and forward tools accept standard SSH connection parameters: `port`, `identity_file`, `known_hosts_file`, `strict_host_key_checking`, and `extra_ssh_args`. So do `ssh_view`, `ssh_create`, `ssh_edit`, `ssh_grep`, and `ssh_glob`.
-
-## OpenAI function registration
-
-The MCP tool schemas accept both booleans and strings for
-`strict_host_key_checking`: `true` maps to `yes`, `false` maps to `no`, and
-`yes`, `no`, `ask`, `accept-new`, and `off` select the OpenSSH mode. Omit
-the parameter to use your SSH configuration.
-
-When adapting `tools/list` results to OpenAI function tools, copy each
-`inputSchema` to `parameters` and explicitly set `strict: false`. The schemas
-use supported `anyOf` unions, but preserve optional parameters and arbitrary
-`env` keys. OpenAI strict mode requires every property to be required and
-every object to set `additionalProperties: false`; enabling it directly would
-change those interfaces. See the [OpenAI function-calling guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode).
-
-## Development
-
-```bash
-python3 -m pip install build -e ".[test]"
-python3 -m unittest discover -s tests -v
-python3 -m compileall src
-python3 -m build
-```
-
-## License
-
-MIT. See `LICENSE`.
+上游工具的完整参数说明见 [上游 README](https://github.com/slepp/ssh-mcp)。本项目采用 MIT 许可证，见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

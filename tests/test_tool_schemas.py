@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -23,8 +25,18 @@ def discover_tools():
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     ]
     output = io.BytesIO()
-    McpServer(stdin=io.BytesIO(b"".join(json.dumps(r).encode() + b"\n" for r in requests)),
-              stdout=output).serve()
+    with mock.patch.dict(
+        os.environ,
+        {
+            "SSH_MCP_POLICY_CONFIG": str(
+                Path(__file__).with_name("missing-policy-for-tests.json")
+            ),
+            "SSH_MCP_DELETE_ROOTS": "",
+            "SSH_MCP_SUDO_COMMANDS": "",
+        },
+    ):
+        McpServer(stdin=io.BytesIO(b"".join(json.dumps(r).encode() + b"\n" for r in requests)),
+                  stdout=output).serve()
     replies = [json.loads(line) for line in output.getvalue().splitlines()]
     return replies[1]["result"]["tools"]
 
@@ -47,7 +59,7 @@ class ToolSchemaTests(unittest.TestCase):
                 audit(child)
 
         tools = discover_tools()
-        self.assertEqual(len(tools), 17)
+        self.assertEqual(len(tools), 24)
         self.assertEqual(len({t["name"] for t in tools}), len(tools))
         for tool in tools:
             with self.subTest(tool=tool["name"]):
@@ -73,7 +85,7 @@ class ToolSchemaTests(unittest.TestCase):
                 with self.subTest(tool=tool["name"], invalid=value):
                     with self.assertRaises(SchemaError):
                         validator.validate(value)
-        self.assertEqual(count, 11)
+        self.assertEqual(count, 15)
 
     def test_host_key_transport_arguments_and_runtime_validation(self):
         for value, mode in [(True, "yes"), (False, "no"), ("yes", "yes"),

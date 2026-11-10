@@ -1,0 +1,6 @@
+This repository is a policy-focused modification of:
+https://github.com/slepp/ssh-mcp
+
+The upstream project is licensed under the MIT License. The original license
+text is preserved in LICENSE. Modifications in this repository are maintained
+separately from the upstream project.

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import sys
 import traceback
+from copy import deepcopy
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from . import __version__
+from .policy import PolicyViolation
 from .ssh import ForwardNotFoundError, RemoteFileError, SessionNotFoundError, SshToolService, ValidationError
 
 SERVER_NAME = "ssh-mcp"
@@ -374,7 +376,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "ssh_start_session",
         "description": (
-            "Start a new persistent interactive SSH session backed by a local PTY. "
+            "Start a normal-policy interactive SSH session backed by a local PTY. "
+            "Common sudo and destructive commands are blocked on input. "
             "Returns the session id, initial output, and observer metadata. "
             "If 'truncated' is true or 'pending_output_chars' > 0 in the response, "
             "call ssh_read_session to retrieve the remaining buffered output. "
@@ -492,7 +495,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "ssh_write_session",
         "description": (
-            "Write text or a control sequence to a tracked SSH session PTY. "
+            "Write text or a control sequence to a normal-policy SSH session PTY. "
+            "Common sudo and destructive commands are blocked; use ssh_sudo_exec or ssh_delete instead. "
             "Always terminate commands with a trailing newline (\\n) to submit them. "
             "Control characters: \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, \\u001a for Ctrl-Z. "
             "Use wait_seconds (e.g. 1-5) to receive the command response in the same call. "
@@ -627,6 +631,129 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+def _clone_tool_definition(base_name: str, name: str, description: str) -> dict[str, Any]:
+    base = next(tool for tool in TOOL_DEFINITIONS if tool["name"] == base_name)
+    clone = deepcopy(base)
+    clone["name"] = name
+    clone["description"] = description
+    return clone
+
+
+_sudo_exec_tool = _clone_tool_definition(
+    "ssh_exec",
+    "ssh_sudo_exec",
+    "Run one approval-gated sudo executable. Uses sudo -n, requires an absolute executable path, rejects shell operators and destructive commands, and only permits prefixes listed in SSH_MCP_SUDO_COMMANDS.",
+)
+_sudo_exec_properties = _sudo_exec_tool["inputSchema"]["properties"]
+for _key in ("cwd", "env", "shell", "tty"):
+    _sudo_exec_properties.pop(_key, None)
+_sudo_exec_properties["command"]["description"] = (
+    "One absolute executable path followed by arguments, e.g. /usr/bin/apt-get update. "
+    "Shell operators, pipelines, and destructive commands are rejected."
+)
+
+_delete_tool: dict[str, Any] = {
+    "name": "ssh_delete",
+    "description": (
+        "Delete literal paths under approved data roots. Defaults to dry-run; actual deletion "
+        "requires both dry_run=false and confirm=true. System roots and glob paths are rejected."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["target", "paths"],
+        "properties": {
+            "target": {"type": "string", "description": "OpenSSH target such as host alias or user@host."},
+            "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+                "description": "Literal absolute paths or paths under ~/; globs and protected roots are rejected.",
+            },
+            "recursive": {"type": "boolean", "description": "Recursively remove directories. Default: false."},
+            "dry_run": {"type": "boolean", "description": "Preview only. Default: true."},
+            "confirm": {"type": "boolean", "description": "Must be true together with dry_run=false to delete."},
+            "timeout": {"type": "number", "description": "Local timeout in seconds."},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "identity_file": {"type": "string"},
+            "known_hosts_file": {"type": "string"},
+            "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+            "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+        },
+    },
+}
+
+_admin_session_start_tool = _clone_tool_definition(
+    "ssh_start_session",
+    "ssh_admin_session_start",
+    "Start an explicitly privileged interactive SSH session. Sudo is permitted, while common destructive commands and shell chaining are blocked by best-effort input checks. This is not a sandbox; enforce privilege limits with remote sudoers.",
+)
+_admin_session_ensure_tool = _clone_tool_definition(
+    "ssh_ensure_session",
+    "ssh_admin_session_ensure",
+    "Reuse or start an explicitly privileged interactive session. Sudo commands must use ssh_admin_sudo_session_write; approve this tool only when the admin session is needed.",
+)
+_admin_session_write_tool = _clone_tool_definition(
+    "ssh_write_session",
+    "ssh_admin_session_write",
+    "Write input to an explicitly privileged SSH session. Each call should be reviewed; the session can run arbitrary commands.",
+)
+_admin_session_write_tool["description"] += (
+    " Sudo and destructive commands are rejected; use the separate sudo-write or delete tool. Send one reviewed command or response per call."
+)
+_admin_sudo_write_tool: dict[str, Any] = {
+    "name": "ssh_admin_sudo_session_write",
+    "description": (
+        "Run one allowlisted sudo executable in an admin PTY session. It uses sudo -n and "
+        "requires the command prefix to match SSH_MCP_SUDO_COMMANDS. This is a distinct tool "
+        "so the MCP client can request a separate approval."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["session_id", "command"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "command": {"type": "string", "description": "One absolute executable path and its arguments; shell operators are rejected."},
+            "wait_seconds": {"type": "number", "minimum": 0},
+            "max_output_chars": {"type": "integer", "minimum": 1},
+        },
+    },
+}
+_admin_session_key_tool: dict[str, Any] = {
+    "name": "ssh_admin_session_key",
+    "description": (
+        "Send one named terminal key to an admin PTY session. Supported keys are enter, tab, escape, "
+        "arrows, ctrl-c/d/z, q, y, and n; arbitrary text is not accepted."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["session_id", "key"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "key": {
+                "type": "string",
+                "enum": ["enter", "tab", "escape", "up", "down", "right", "left", "ctrl-c", "ctrl-d", "ctrl-z", "q", "y", "n"],
+            },
+            "wait_seconds": {"type": "number", "minimum": 0},
+            "max_output_chars": {"type": "integer", "minimum": 1},
+        },
+    },
+}
+TOOL_DEFINITIONS.extend(
+    [
+        _sudo_exec_tool,
+        _delete_tool,
+        _admin_session_start_tool,
+        _admin_session_ensure_tool,
+        _admin_session_write_tool,
+        _admin_sudo_write_tool,
+        _admin_session_key_tool,
+    ]
+)
+
+
 class McpServer:
     def __init__(
         self,
@@ -641,6 +768,8 @@ class McpServer:
         self._initialized = False
         self._tool_handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
             "ssh_exec": self._tool_service.ssh_exec,
+            "ssh_sudo_exec": self._tool_service.ssh_sudo_exec,
+            "ssh_delete": self._tool_service.ssh_delete,
             "ssh_scp": self._tool_service.ssh_scp,
             "ssh_sync": self._tool_service.ssh_sync,
             "ssh_view": self._tool_service.ssh_view,
@@ -649,9 +778,14 @@ class McpServer:
             "ssh_grep": self._tool_service.ssh_grep,
             "ssh_glob": self._tool_service.ssh_glob,
             "ssh_start_session": self._tool_service.ssh_start_session,
+            "ssh_admin_session_start": self._tool_service.ssh_admin_session_start,
+            "ssh_admin_session_ensure": self._tool_service.ssh_admin_session_ensure,
             "ssh_ensure_session": self._tool_service.ssh_ensure_session,
             "ssh_read_session": self._tool_service.ssh_read_session,
             "ssh_write_session": self._tool_service.ssh_write_session,
+            "ssh_admin_session_write": self._tool_service.ssh_admin_session_write,
+            "ssh_admin_sudo_session_write": self._tool_service.ssh_admin_sudo_session_write,
+            "ssh_admin_session_key": self._tool_service.ssh_admin_session_key,
             "ssh_stop_session": self._tool_service.ssh_stop_session,
             "ssh_list_sessions": self._tool_service.ssh_list_sessions,
             "ssh_forward": self._tool_service.ssh_forward,
@@ -808,6 +942,8 @@ class McpServer:
             return _tool_error(f"Unknown tool '{name}'.", error_type="unknown_tool")
         try:
             return _tool_success(handler(arguments))
+        except PolicyViolation as exc:
+            return _tool_error(str(exc), error_type="policy_denied")
         except ValidationError as exc:
             return _tool_error(str(exc), error_type="validation_error")
         except SessionNotFoundError as exc:

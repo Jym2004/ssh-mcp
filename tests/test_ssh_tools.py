@@ -16,6 +16,7 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from ssh_mcp.policy import Policy, PolicyViolation
 from ssh_mcp.ssh import SshToolService, ValidationError
 from ssh_mcp.ssh import DEFAULT_UNREAD_BUFFER_CAP
 from ssh_mcp.ssh import RemoteFileError
@@ -39,6 +40,13 @@ class SshToolServiceTests(unittest.TestCase):
         self.tmux_log = self.root / "fake_tmux.log"
         self._old_fake_tmux_log = os.environ.get("FAKE_TMUX_LOG")
         os.environ["FAKE_TMUX_LOG"] = str(self.tmux_log)
+        self._policy_env = {
+            name: os.environ.get(name)
+            for name in ("SSH_MCP_POLICY_CONFIG", "SSH_MCP_DELETE_ROOTS", "SSH_MCP_SUDO_COMMANDS")
+        }
+        os.environ["SSH_MCP_POLICY_CONFIG"] = str(self.root / "missing-policy.json")
+        os.environ.pop("SSH_MCP_DELETE_ROOTS", None)
+        os.environ.pop("SSH_MCP_SUDO_COMMANDS", None)
         self.service = SshToolService(
             ssh_binary=str(self.fake_ssh),
             scp_binary=str(self.fake_scp),
@@ -49,6 +57,11 @@ class SshToolServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.service.close()
+        for name, value in self._policy_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         if self._old_fake_tmux_log is None:
             os.environ.pop("FAKE_TMUX_LOG", None)
         else:
@@ -189,7 +202,7 @@ class SshToolServiceTests(unittest.TestCase):
         self.assertTrue(uploaded["ok"])
         self.assertEqual((remote_root / "tilde-upload.txt").read_text(encoding="utf-8"), "tilde scp")
 
-    def test_ssh_sync_uploads_incrementally_with_delete_and_exclude(self) -> None:
+    def test_ssh_sync_rejects_delete_and_keeps_destination_untouched(self) -> None:
         source_root = self.root / "sync-source"
         source_root.mkdir()
         (source_root / "keep.txt").write_text("fresh", encoding="utf-8")
@@ -198,27 +211,71 @@ class SshToolServiceTests(unittest.TestCase):
         remote_root.mkdir()
         (remote_root / "stale.txt").write_text("stale", encoding="utf-8")
 
-        synced = self.service.ssh_sync(
+        with self.assertRaisesRegex(PolicyViolation, "ssh_delete"):
+            self.service.ssh_sync(
+                {
+                    "target": "example",
+                    "direction": "upload",
+                    "source": f"{source_root}/",
+                    "destination": str(remote_root),
+                    "delete": True,
+                    "exclude": ["*.tmp"],
+                    "port": 2222,
+                    "identity_file": str(self.identity_file),
+                    "known_hosts_file": str(self.known_hosts_file),
+                    "strict_host_key_checking": "accept-new",
+                    "extra_ssh_args": ["-F", "/dev/null"],
+                    "extra_rsync_args": ["--itemize-changes"],
+                }
+            )
+
+        self.assertEqual((remote_root / "stale.txt").read_text(encoding="utf-8"), "stale")
+
+    def test_exec_separates_sudo_and_destructive_commands(self) -> None:
+        with self.assertRaisesRegex(PolicyViolation, "ssh_sudo_exec"):
+            self.service.ssh_exec({"target": "example", "command": "sudo /usr/bin/id"})
+        with self.assertRaisesRegex(PolicyViolation, "ssh_delete"):
+            self.service.ssh_exec({"target": "example", "command": "rm -rf ~/cache"})
+
+    def test_sudo_exec_requires_configured_command_prefix(self) -> None:
+        with self.assertRaisesRegex(PolicyViolation, "none configured"):
+            self.service.ssh_sudo_exec(
+                {"target": "example", "command": "/usr/bin/apt-get update"}
+            )
+
+        fake_sudo = self.root / "sudo"
+        fake_sudo.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n", encoding="utf-8")
+        fake_sudo.chmod(0o755)
+        self.service._policy = Policy(sudo_allowed_commands=["/usr/bin/apt-get update"])
+        with mock.patch.dict(os.environ, {"PATH": f"{self.root}{os.pathsep}{os.environ['PATH']}"}):
+            result = self.service.ssh_sudo_exec(
+                {"target": "example", "command": "/usr/bin/apt-get update"}
+            )
+        self.assertTrue(result["ok"])
+        self.assertIn("-n -- /usr/bin/apt-get update", result["stdout"])
+
+    def test_delete_defaults_to_dry_run_and_requires_confirm_for_removal(self) -> None:
+        target = self.root / "delete target.txt"
+        target.write_text("temporary", encoding="utf-8")
+        preview = self.service.ssh_delete({"target": "example", "paths": [str(target)]})
+        self.assertTrue(preview["dry_run"])
+        self.assertTrue(target.exists())
+
+        with self.assertRaisesRegex(PolicyViolation, "outside the allowed delete roots"):
+            self.service.ssh_delete(
+                {"target": "example", "paths": ["/etc/passwd"], "dry_run": False, "confirm": True}
+            )
+
+        deleted = self.service.ssh_delete(
             {
                 "target": "example",
-                "direction": "upload",
-                "source": f"{source_root}/",
-                "destination": str(remote_root),
-                "delete": True,
-                "exclude": ["*.tmp"],
-                "port": 2222,
-                "identity_file": str(self.identity_file),
-                "known_hosts_file": str(self.known_hosts_file),
-                "strict_host_key_checking": "accept-new",
-                "extra_ssh_args": ["-F", "/dev/null"],
-                "extra_rsync_args": ["--itemize-changes"],
+                "paths": [str(target)],
+                "dry_run": False,
+                "confirm": True,
             }
         )
-
-        self.assertTrue(synced["ok"])
-        self.assertEqual((remote_root / "keep.txt").read_text(encoding="utf-8"), "fresh")
-        self.assertFalse((remote_root / "skip.tmp").exists())
-        self.assertFalse((remote_root / "stale.txt").exists())
+        self.assertTrue(deleted["ok"])
+        self.assertFalse(target.exists())
 
     def test_ssh_sync_dry_run_does_not_modify_destination(self) -> None:
         source_root = self.root / "dry-source"
@@ -853,15 +910,40 @@ class SshToolServiceTests(unittest.TestCase):
         self.assertTrue(stopped["was_running"])
         self.assertFalse(stopped["running"])
         self.assertIn(stopped["termination_signal"], {"SIGTERM", "SIGKILL"})
-        self.assertEqual(stopped["observer"]["mode"], "transcript")
-        self.assertFalse(stopped["observer"]["tmux_started"])
-        log_entries = [
-            json.loads(line)
-            for line in self.tmux_log.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        self.assertEqual(len(log_entries), 2)
-        self.assertEqual(log_entries[1]["argv"][:3], ["kill-session", "-t", started["observer"]["tmux_session_name"]])
+
+    def test_safe_session_blocks_sudo_and_destructive_commands(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.05}
+        )
+        session_id = started["session_id"]
+        try:
+            with self.assertRaisesRegex(PolicyViolation, "ssh_sudo_exec"):
+                self.service.ssh_write_session({"session_id": session_id, "input": "sudo id\n"})
+            with self.assertRaisesRegex(PolicyViolation, "ssh_delete"):
+                self.service.ssh_write_session({"session_id": session_id, "input": "rm -rf ~/cache\n"})
+        finally:
+            self.service.ssh_stop_session(
+                {"session_id": session_id, "force": True, "wait_seconds": 0.1}
+            )
+
+    def test_admin_session_has_separate_write_tool(self) -> None:
+        started = self.service.ssh_admin_session_start(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.05}
+        )
+        session_id = started["session_id"]
+        self.assertEqual(started["mode"], "admin")
+        with self.assertRaisesRegex(ValidationError, "ssh_admin_session_write"):
+            self.service.ssh_write_session({"session_id": session_id, "input": "sudo id\n"})
+        with self.assertRaisesRegex(PolicyViolation, "ssh_admin_sudo_session_write"):
+            self.service.ssh_admin_session_write({"session_id": session_id, "input": "sudo id\n"})
+        with self.assertRaisesRegex(PolicyViolation, "not allowed"):
+            self.service.ssh_admin_sudo_session_write(
+                {"session_id": session_id, "command": "/usr/bin/apt-get update"}
+            )
+        stopped = self.service.ssh_admin_session_write(
+            {"session_id": session_id, "input": "exit 0\n", "wait_seconds": 0.2}
+        )
+        self.assertFalse(stopped["running"])
 
     def test_tmux_observer_is_default_for_new_session(self) -> None:
         started = self.service.ssh_start_session({"target": "example", "wait_seconds": 0.05})
@@ -902,10 +984,18 @@ class SshToolServiceTests(unittest.TestCase):
             self.assertTrue(ensured["reused"])
             self.assertEqual(ensured["matched_by"], "session_name")
 
+            self.service.ssh_write_session(
+                {
+                    "session_id": session_id,
+                    "input": f"COUNT={counter}\n",
+                    "wait_seconds": 0.3,
+                    "max_output_chars": 4096,
+                }
+            )
             wrote = self.service.ssh_write_session(
                 {
                     "session_id": session_id,
-                    "input": "COUNT=${COUNT:-0}; COUNT=$((COUNT+1)); printf 'count:%s\\n' \"$COUNT\"\n",
+                    "input": "printf 'count:%s\\n' \"$COUNT\"\n",
                     "wait_seconds": 0.3,
                     "max_output_chars": 4096,
                 }

@@ -28,6 +28,9 @@ class StdioServerTests(unittest.TestCase):
         env["SSH_MCP_RSYNC_BIN"] = str(self.fake_rsync)
         env["SSH_MCP_TMUX_BIN"] = str(self.fake_tmux)
         env["SSH_MCP_STATE_DIR"] = str(self.root / "state")
+        env["SSH_MCP_POLICY_CONFIG"] = str(self.root / "missing-policy.json")
+        env["SSH_MCP_DELETE_ROOTS"] = ""
+        env["SSH_MCP_SUDO_COMMANDS"] = ""
         env["FAKE_TMUX_LOG"] = str(self.tmux_log)
         self.process = subprocess.Popen(
             [sys.executable, "-m", "ssh_mcp"],
@@ -108,6 +111,13 @@ class StdioServerTests(unittest.TestCase):
         self.assertIn("ssh_glob", names)
         self.assertIn("ssh_start_session", names)
         self.assertIn("ssh_ensure_session", names)
+        self.assertIn("ssh_sudo_exec", names)
+        self.assertIn("ssh_delete", names)
+        self.assertIn("ssh_admin_session_start", names)
+        self.assertIn("ssh_admin_session_ensure", names)
+        self.assertIn("ssh_admin_session_write", names)
+        self.assertIn("ssh_admin_sudo_session_write", names)
+        self.assertIn("ssh_admin_session_key", names)
 
         exec_call = self._rpc(
             {

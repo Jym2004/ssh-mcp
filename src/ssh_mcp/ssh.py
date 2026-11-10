@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .policy import Policy, PolicyViolation, build_delete_command
+
 DEFAULT_MAX_OUTPUT_CHARS = 65_536
 # Hard cap on in-memory unread-output buffer per session.  The transcript on
 # disk always receives the full stream; only the in-memory ring is bounded.
@@ -31,6 +33,7 @@ DEFAULT_VIEW_MAX_BYTES = 20_480  # 20 KiB, matches the local file-viewing tool's
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_STRICT_HOST_KEY_CHECKING = {"yes", "no", "ask", "accept-new", "off"}
 _ALLOWED_OBSERVER_MODES = {"transcript", "tmux"}
+_ALLOWED_SESSION_MODES = {"safe", "admin"}
 _ALLOWED_GREP_OUTPUT_MODES = {"content", "files_with_matches", "count"}
 _EXIT_SIGNAL_NAMES = {9: "killed", 13: "broken-pipe", 15: "terminated"}
 
@@ -843,6 +846,87 @@ def _build_script_command(script: str, args: Sequence[str]) -> str:
     return "exec sh -c " + " ".join(words)
 
 
+_REMOTE_DELETE_SCRIPT = r"""
+set -eu
+recursive=$1
+dry_run=$2
+root_count=$3
+shift 3
+roots_file=$(mktemp)
+targets_file=$(mktemp)
+trap 'rm -f "$roots_file" "$targets_file"' EXIT HUP INT TERM
+
+expand_home() {
+    case "$1" in
+        "~") printf '%s' "$HOME" ;;
+        "~/"*) printf '%s/%s' "$HOME" "${1#~/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+i=0
+while [ "$i" -lt "$root_count" ]; do
+    raw_root=$1
+    shift
+    i=$((i + 1))
+    root=$(expand_home "$raw_root")
+    canonical_root=$(realpath -e -- "$root" 2>/dev/null || true)
+    if [ -n "$canonical_root" ] && [ "$canonical_root" != "/" ]; then
+        printf '%s\n' "$canonical_root" >> "$roots_file"
+    fi
+done
+
+if [ ! -s "$roots_file" ]; then
+    echo "delete denied: no configured delete roots exist on the remote host" >&2
+    exit 4
+fi
+
+for raw_path in "$@"; do
+    path=$(expand_home "$raw_path")
+    case "$path" in
+        /*) ;;
+        *) echo "delete denied: path is not absolute: $raw_path" >&2; exit 4 ;;
+    esac
+    if [ -L "$path" ]; then
+        echo "delete denied: refusing a symlink target: $raw_path" >&2
+        exit 4
+    fi
+    canonical_path=$(realpath -e -- "$path" 2>/dev/null) || {
+        echo "delete denied: path does not exist or cannot be resolved: $raw_path" >&2
+        exit 4
+    }
+    allowed=0
+    while IFS= read -r root; do
+        if [ "$canonical_path" = "$root" ]; then
+            echo "delete denied: refusing to delete an allowed root itself: $raw_path" >&2
+            exit 4
+        fi
+        case "$canonical_path" in
+            "$root"/*) allowed=1 ;;
+        esac
+    done < "$roots_file"
+    if [ "$allowed" -ne 1 ]; then
+        echo "delete denied: resolved path is outside allowed roots: $raw_path" >&2
+        exit 4
+    fi
+    printf '%s\n' "$canonical_path" >> "$targets_file"
+done
+
+if [ "$dry_run" = "1" ]; then
+    sed 's/^/would_delete: /' "$targets_file"
+    exit 0
+fi
+
+while IFS= read -r target; do
+    if [ "$recursive" = "1" ]; then
+        rm -r -- "$target"
+    else
+        rm -- "$target"
+    fi
+done < "$targets_file"
+"""
+
+
 def _remote_file_error_for_exit(
     exit_code: int | None, path: str, *, timed_out: bool, stderr: str
 ) -> RemoteFileError | None:
@@ -1296,10 +1380,12 @@ class SshSession:
         observer_mode: str,
         tmux_binary: str | None,
         auto_close: bool = False,
+        mode: str = "safe",
     ) -> None:
         self.session_id = session_id
         self.session_name = session_name
         self.target = target
+        self.mode = mode
         self.argv = list(argv)
         self.ssh_command = shlex.join(argv)
         self.remote_command = remote_command
@@ -1610,6 +1696,7 @@ class SshSession:
             "session_id": self.session_id,
             "session_name": self.session_name,
             "target": self.target,
+            "mode": self.mode,
             "running": running,
             "exit_code": exit_code,
             "signal": term_signal,
@@ -1792,6 +1879,7 @@ class SessionManager:
         remote_command: str | None,
         observer_mode: str,
         auto_close: bool = False,
+        mode: str = "safe",
     ) -> SshSession:
         with self._lock:
             self._prune_exited_locked()
@@ -1836,6 +1924,7 @@ class SessionManager:
                     observer_mode=observer_mode,
                     tmux_binary=self._tmux_binary,
                     auto_close=auto_close,
+                    mode=mode,
                 )
             except Exception:
                 _terminate_process_group(process, grace_period=0.1)
@@ -1857,6 +1946,7 @@ class SessionManager:
         remote_command: str | None,
         observer_mode: str,
         auto_close: bool = False,
+        mode: str = "safe",
     ) -> tuple[SshSession, bool, str | None]:
         with self._lock:
             self._prune_exited_locked()
@@ -1873,6 +1963,11 @@ class SessionManager:
                 )
             if matches:
                 session = matches[0]
+                if session.mode != mode:
+                    raise ValidationError(
+                        f"Session '{session.session_id}' is a {session.mode} session; "
+                        f"requested a {mode} session. Stop it or use a different session_name."
+                    )
                 reused = True
                 matched_by = "session_name" if session_name is not None else "target"
             else:
@@ -1883,6 +1978,7 @@ class SessionManager:
                     remote_command=remote_command,
                     observer_mode=observer_mode,
                     auto_close=auto_close,
+                    mode=mode,
                 )
                 reused = False
                 matched_by = None
@@ -1940,11 +2036,13 @@ class SshToolService:
         rsync_binary: str | None = None,
         tmux_binary: str | None = None,
         state_dir: str | Path | None = None,
+        policy: Policy | None = None,
     ) -> None:
         self._configured_ssh_binary = ssh_binary or os.environ.get("SSH_MCP_SSH_BIN", "ssh")
         self._configured_scp_binary = scp_binary or os.environ.get("SSH_MCP_SCP_BIN", "scp")
         self._configured_rsync_binary = rsync_binary or os.environ.get("SSH_MCP_RSYNC_BIN", "rsync")
         self._configured_tmux_binary = tmux_binary or os.environ.get("SSH_MCP_TMUX_BIN", "tmux")
+        self._policy = policy or Policy()
         self._state_dir = Path(state_dir).expanduser() if state_dir is not None else _default_state_dir()
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._sessions = SessionManager(state_dir=self._state_dir, tmux_binary=self._configured_tmux_binary)
@@ -1977,6 +2075,7 @@ class SshToolService:
         environment = _env_argument(validated)
         timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
         tty = _bool_argument(validated, "tty", default=False)
+        self._policy.check_exec(command)
         ssh_binary = _resolve_ssh_binary(self._configured_ssh_binary)
         remote_command = build_exec_remote_command(
             command,
@@ -1989,6 +2088,57 @@ class SshToolService:
         result["ok"] = result["exit_code"] == 0 and not result["timed_out"]
         result["target"] = connection.target
         result["command"] = command
+        return result
+
+    def ssh_sudo_exec(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        command = _string_argument(validated, "command", required=True, strip=False)
+        sudo_argv = self._policy.authorize_sudo_exec(command)
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+        ssh_binary = _resolve_ssh_binary(self._configured_ssh_binary)
+        remote_command = "sudo -n -- " + shlex.join(sudo_argv)
+        argv = connection.build_argv(ssh_binary, remote_command, tty=False)
+        result = _run_without_pty(argv, timeout=timeout)
+        result["ok"] = result["exit_code"] == 0 and not result["timed_out"]
+        result["target"] = connection.target
+        result["command"] = command
+        result["sudo"] = True
+        return result
+
+    def ssh_delete(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        paths = _string_list_argument(validated, "paths", required=True, strip=True, minimum_length=1)
+        recursive = _bool_argument(validated, "recursive", default=False)
+        dry_run = _bool_argument(validated, "dry_run", default=True)
+        confirm = _bool_argument(validated, "confirm", default=False)
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+        self._policy.check_delete_paths(paths)
+        command = build_delete_command(paths, recursive=recursive)
+        effective_dry_run = dry_run or not confirm
+        result = self._run_remote_script(
+            connection,
+            _REMOTE_DELETE_SCRIPT,
+            [
+                "1" if recursive else "0",
+                "1" if effective_dry_run else "0",
+                str(len(self._policy.delete_roots)),
+                *self._policy.delete_roots,
+                *paths,
+            ],
+            timeout=timeout,
+        )
+        result["ok"] = result["exit_code"] == 0 and not result["timed_out"]
+        result["target"] = connection.target
+        result["paths"] = paths
+        result["recursive"] = recursive
+        result["command"] = command
+        result["dry_run"] = effective_dry_run
+        if result["exit_code"] == 4 and str(result.get("stderr", "")).startswith("delete denied:"):
+            raise PolicyViolation(str(result["stderr"]).strip())
+        if effective_dry_run and result["ok"]:
+            result["message"] = "No files were deleted; remote canonical paths were validated."
         return result
 
     def ssh_scp(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -2035,6 +2185,7 @@ class SshToolService:
         source = _string_argument(validated, "source", required=True, strip=False)
         destination = _string_argument(validated, "destination", required=True, strip=False)
         delete = _bool_argument(validated, "delete", default=False)
+        self._policy.check_sync_delete(delete)
         compress = _bool_argument(validated, "compress", default=True)
         dry_run = _bool_argument(validated, "dry_run", default=False)
         exclude = _exclude_argument(validated)
@@ -2348,16 +2499,21 @@ class SshToolService:
             "truncated": truncated,
         }
 
-    def _parse_session_arguments(self, arguments: Mapping[str, Any]) -> tuple[
-        Mapping[str, Any], ConnectionSettings, str | None, str, bool,
-        float, int, list[str], str | None,
-    ]:
+    def _parse_session_arguments(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        mode: str,
+    ) -> tuple[Mapping[str, Any], ConnectionSettings, str | None, str, bool, float, int, list[str], str | None, str]:
+        if mode not in _ALLOWED_SESSION_MODES:
+            raise ValidationError(f"session mode must be one of: {', '.join(sorted(_ALLOWED_SESSION_MODES))}.")
         validated = _validate_arguments(arguments)
         connection = ConnectionSettings.from_arguments(validated)
         session_name = _string_argument(validated, "session_name")
         cwd = _string_argument(validated, "cwd")
         shell = _string_argument(validated, "shell")
         environment = _env_argument(validated)
+        self._policy.check_session_options(shell=shell, environment=environment)
         observer_mode = _observer_mode_argument(validated)
         auto_close = _bool_argument(validated, "auto_close", default=False)
         wait_seconds = _float_argument(
@@ -2378,12 +2534,14 @@ class SshToolService:
         argv = connection.build_argv(ssh_binary, remote_command, tty=True, keepalive=True)
         return (
             validated, connection, session_name, observer_mode, auto_close,
-            wait_seconds, max_output_chars, argv, remote_command,
+            wait_seconds, max_output_chars, argv, remote_command, mode,
         )
 
     def ssh_start_session(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         (_, connection, session_name, observer_mode, auto_close,
-         wait_seconds, max_output_chars, argv, remote_command) = self._parse_session_arguments(arguments)
+         wait_seconds, max_output_chars, argv, remote_command, mode) = self._parse_session_arguments(
+            arguments, mode="safe",
+        )
         session = self._sessions.start(
             session_name=session_name,
             target=connection.target,
@@ -2391,13 +2549,33 @@ class SshToolService:
             remote_command=remote_command,
             observer_mode=observer_mode,
             auto_close=auto_close,
+            mode=mode,
         )
         result = session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
         return result
 
-    def ssh_ensure_session(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    def ssh_admin_session_start(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         (_, connection, session_name, observer_mode, auto_close,
-         wait_seconds, max_output_chars, argv, remote_command) = self._parse_session_arguments(arguments)
+         wait_seconds, max_output_chars, argv, remote_command, mode) = self._parse_session_arguments(
+            arguments, mode="admin",
+        )
+        session = self._sessions.start(
+            session_name=session_name,
+            target=connection.target,
+            argv=argv,
+            remote_command=remote_command,
+            observer_mode=observer_mode,
+            auto_close=auto_close,
+            mode=mode,
+        )
+        result = session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
+        return result
+
+    def ssh_admin_session_ensure(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        (_, connection, session_name, observer_mode, auto_close,
+         wait_seconds, max_output_chars, argv, remote_command, mode) = self._parse_session_arguments(
+            arguments, mode="admin",
+        )
         session, reused, matched_by = self._sessions.ensure(
             session_name=session_name,
             target=connection.target,
@@ -2405,6 +2583,27 @@ class SshToolService:
             remote_command=remote_command,
             observer_mode=observer_mode,
             auto_close=auto_close,
+            mode=mode,
+        )
+        result = session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
+        result["created"] = not reused
+        result["reused"] = reused
+        result["matched_by"] = matched_by
+        return result
+
+    def ssh_ensure_session(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        (_, connection, session_name, observer_mode, auto_close,
+         wait_seconds, max_output_chars, argv, remote_command, mode) = self._parse_session_arguments(
+            arguments, mode="safe",
+        )
+        session, reused, matched_by = self._sessions.ensure(
+            session_name=session_name,
+            target=connection.target,
+            argv=argv,
+            remote_command=remote_command,
+            observer_mode=observer_mode,
+            auto_close=auto_close,
+            mode=mode,
         )
         result = session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
         result["created"] = not reused
@@ -2428,7 +2627,7 @@ class SshToolService:
         session = self._sessions.get(session_id)
         return session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
 
-    def ssh_write_session(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    def _write_session(self, arguments: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
         validated = _validate_arguments(arguments)
         session_id = _string_argument(validated, "session_id", required=True)
         input_text = arguments.get("input")
@@ -2445,8 +2644,85 @@ class SshToolService:
             allow_zero=False,
         )
         session = self._sessions.get(session_id)
+        if session.mode != mode:
+            raise ValidationError(
+                f"Session '{session_id}' is a {session.mode} session; use the matching "
+                f"{'ssh_admin_session_write' if session.mode == 'admin' else 'ssh_write_session'} tool."
+            )
+        self._policy.check_session_input(input_text, mode=mode)
         return session.write(
             input_text=input_text,
+            wait_seconds=wait_seconds,
+            max_output_chars=max_output_chars,
+        )
+
+    def ssh_write_session(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return self._write_session(arguments, mode="safe")
+
+    def ssh_admin_session_write(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return self._write_session(arguments, mode="admin")
+
+    def ssh_admin_sudo_session_write(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        session_id = _string_argument(validated, "session_id", required=True)
+        command = _string_argument(validated, "command", required=True, strip=False)
+        wait_seconds = _float_argument(
+            validated, "wait_seconds", default=DEFAULT_SESSION_WRITE_WAIT_SECONDS, minimum=0.0,
+        )
+        max_output_chars = _int_argument(
+            validated,
+            "max_output_chars",
+            default=DEFAULT_MAX_OUTPUT_CHARS,
+            minimum=1,
+            allow_zero=False,
+        )
+        session = self._sessions.get(session_id)
+        if session.mode != "admin":
+            raise ValidationError("ssh_admin_sudo_session_write requires an admin session.")
+        sudo_argv = self._policy.authorize_sudo_exec(command)
+        input_text = "sudo -n -- " + shlex.join(sudo_argv) + "\n"
+        return session.write(
+            input_text=input_text,
+            wait_seconds=wait_seconds,
+            max_output_chars=max_output_chars,
+        )
+
+    def ssh_admin_session_key(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        session_id = _string_argument(validated, "session_id", required=True)
+        key = _string_argument(validated, "key", required=True)
+        wait_seconds = _float_argument(
+            validated, "wait_seconds", default=DEFAULT_SESSION_WRITE_WAIT_SECONDS, minimum=0.0,
+        )
+        max_output_chars = _int_argument(
+            validated,
+            "max_output_chars",
+            default=DEFAULT_MAX_OUTPUT_CHARS,
+            minimum=1,
+            allow_zero=False,
+        )
+        keys = {
+            "enter": "\n",
+            "tab": "\t",
+            "escape": "\x1b",
+            "up": "\x1b[A",
+            "down": "\x1b[B",
+            "right": "\x1b[C",
+            "left": "\x1b[D",
+            "ctrl-c": "\x03",
+            "ctrl-d": "\x04",
+            "ctrl-z": "\x1a",
+            "q": "q",
+            "y": "y",
+            "n": "n",
+        }
+        if key not in keys:
+            raise ValidationError(f"'key' must be one of: {', '.join(keys)}")
+        session = self._sessions.get(session_id)
+        if session.mode != "admin":
+            raise ValidationError("ssh_admin_session_key requires an admin session.")
+        return session.write(
+            input_text=keys[key],
             wait_seconds=wait_seconds,
             max_output_chars=max_output_chars,
         )

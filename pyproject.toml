@@ -3,14 +3,14 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slepp-ssh-mcp"
-version = "0.2.0"
-description = "A stdio MCP server that exposes Bash-like SSH execution, sessions, and remote file read/edit/search."
+name = "ssh-mcp-policy"
+version = "0.3.0"
+description = "A policy-enabled stdio SSH MCP server with separate sudo, delete, and admin-session tools."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = []
-keywords = ["mcp", "ssh", "scp", "rsync", "tmux"]
+keywords = ["mcp", "ssh", "scp", "rsync", "tmux", "policy", "sudo"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -27,12 +27,13 @@ classifiers = [
 test = ["jsonschema>=4.18,<5", "openai>=1.66,<2", "httpx>=0.27,<1"]
 
 [project.urls]
-Homepage = "https://github.com/slepp/ssh-mcp"
-Repository = "https://github.com/slepp/ssh-mcp"
-Issues = "https://github.com/slepp/ssh-mcp/issues"
+Homepage = "https://github.com/Jym2004/ssh-mcp"
+Repository = "https://github.com/Jym2004/ssh-mcp"
+Issues = "https://github.com/Jym2004/ssh-mcp/issues"
 
 [project.scripts]
 ssh-mcp = "ssh_mcp.__main__:main"
+ssh-mcp-policy = "ssh_mcp.__main__:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
