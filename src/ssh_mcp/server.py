@@ -642,14 +642,14 @@ def _clone_tool_definition(base_name: str, name: str, description: str) -> dict[
 _sudo_exec_tool = _clone_tool_definition(
     "ssh_exec",
     "ssh_sudo_exec",
-    "Run one approval-gated sudo executable. Uses sudo -n, requires an absolute executable path, rejects shell operators and destructive commands, and only permits prefixes listed in SSH_MCP_SUDO_COMMANDS.",
+    "Run one approval-gated sudo executable. Uses sudo -n and requires an absolute executable path. Shell operators and destructive commands are rejected. The command must match SSH_MCP_SUDO_COMMANDS, or that setting must be ['*'] to allow any single command that passes these checks.",
 )
 _sudo_exec_properties = _sudo_exec_tool["inputSchema"]["properties"]
 for _key in ("cwd", "env", "shell", "tty"):
     _sudo_exec_properties.pop(_key, None)
 _sudo_exec_properties["command"]["description"] = (
-    "One absolute executable path followed by arguments, e.g. /usr/bin/apt-get update. "
-    "Shell operators, pipelines, and destructive commands are rejected."
+    "Write the full program location followed by arguments, e.g. /usr/bin/apt-get update "
+    "instead of apt-get update. Shell operators, pipelines, and destructive commands are rejected."
 )
 
 _delete_tool: dict[str, Any] = {
@@ -704,8 +704,9 @@ _admin_session_write_tool["description"] += (
 _admin_sudo_write_tool: dict[str, Any] = {
     "name": "ssh_admin_sudo_session_write",
     "description": (
-        "Run one allowlisted sudo executable in an admin PTY session. It uses sudo -n and "
-        "requires the command prefix to match SSH_MCP_SUDO_COMMANDS. This is a distinct tool "
+        "Run one approved sudo executable in an admin PTY session. It uses sudo -n and "
+        "requires the command prefix to match SSH_MCP_SUDO_COMMANDS, unless that setting is ['*']. "
+        "This is a distinct tool "
         "so the MCP client can request a separate approval."
     ),
     "inputSchema": {

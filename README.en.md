@@ -2,60 +2,27 @@
 
 [简体中文](README.md) | English
 
-A policy-focused fork of [slepp/ssh-mcp](https://github.com/slepp/ssh-mcp). It keeps the upstream SSH, file, session, and forwarding tools, while adding separate approval points for high-risk operations.
+A policy-focused fork of [slepp/ssh-mcp](https://github.com/slepp/ssh-mcp). It keeps the upstream SSH, file, session, and forwarding tools, and adds separate approval points for sudo and deletion.
 
-## What changed in this fork
+## Added features
 
-- `ssh_exec` and normal sessions block common sudo and destructive-command patterns.
-- `ssh_sudo_exec` accepts only explicitly allowlisted absolute command prefixes and uses `sudo -n`; it never sends a sudo password through MCP.
-- `ssh_delete` is preview-only by default. Actual deletion requires both `dry_run=false` and `confirm=true`, and is limited by configured delete roots.
-- Admin sessions, session sudo, and fixed terminal keys use separate tools so MCP clients can ask for approval individually.
-- `ssh_sync` rejects rsync `--delete`; use the separately gated `ssh_delete` tool instead.
+- `ssh_exec` and normal sessions block common sudo and destructive commands.
+- `ssh_sudo_exec` runs commands that pass the local policy, using `sudo -n`; no sudo password is sent through MCP. The command must include the full executable path, such as `/usr/bin/systemctl`, not just `systemctl`.
+- `ssh_delete` previews by default. Actual deletion requires both `dry_run=false` and `confirm=true`, and the path must be under a configured delete root.
+- Admin sessions, session sudo, and fixed terminal keys use separate tools. `ssh_sync` rejects rsync `--delete`.
 
-These policies are guardrails, not a shell sandbox. SSH commands still have the remote account's permissions. Use a restricted account and matching server-side `sudoers` rules.
+These policies are guardrails, not a shell sandbox. SSH commands retain the remote account's permissions. Use a restricted account and matching server-side `sudoers` rules.
 
-## Requirements
+## Install and run
 
-- Python 3.10+ and a POSIX environment; interactive sessions require a local PTY.
-- Local OpenSSH. `ssh_sync` also requires local and remote `rsync`; remote search needs `grep`/`find`, and delete validation needs `realpath`.
-
-## Run from a WSL checkout
-
-Install the launcher:
+The server needs Python 3.10+, a POSIX shell, and local OpenSSH. Interactive sessions require a PTY. The MCP client may run elsewhere, but the server process must run in a POSIX environment that can access the SSH configuration, credentials, and network.
 
 ```bash
-mkdir -p ~/.local/bin
-install -m 700 /path/to/checkout/scripts/ssh-mcp-policy-openchamber ~/.local/bin/ssh-mcp-policy-openchamber
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
 
-Set these values in your local MCP client configuration. Do not commit machine-specific values:
-
-- `SSH_MCP_POLICY_HOME`: checkout path as seen from WSL.
-- `SSH_MCP_WINDOWS_SSH_CONFIG`: Windows SSH config path as seen from WSL.
-- `SSH_MCP_ALIAS_REWRITES`: optional comma-separated host mappings in `old=new` form.
-
-OpenCode command example (replace the placeholders):
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "ssh-mcp": {
-        "type": "local",
-        "command": [
-          "wsl.exe", "-d", "<distro>", "--exec", "env",
-          "SSH_MCP_POLICY_HOME=/path/to/checkout",
-          "SSH_MCP_WINDOWS_SSH_CONFIG=/mnt/c/Users/<user>/.ssh/config",
-          "SSH_MCP_ALIAS_REWRITES=old-gpu=gpu-wsl",
-          "/home/<user>/.local/bin/ssh-mcp-policy-openchamber"
-        ]
-      }
-    }
-  }
-}
-```
-
-The launcher copies only safe SSH connection directives; it never copies private keys or `IdentityFile`. On first start, it creates `~/.config/ssh-mcp-policy/policy.json` from `config/policy.example.json`.
+Add a local stdio server to your MCP client: set the command to `.venv/bin/ssh-mcp-policy` and leave arguments empty. See the [upstream README](https://github.com/slepp/ssh-mcp) for the upstream tools' parameter reference.
 
 ## Security defaults
 
@@ -66,14 +33,15 @@ The launcher copies only safe SSH connection directives; it never copies private
 }
 ```
 
-The sudo allowlist is empty by default. Before enabling it, choose exact commands and apply the same scope in remote `sudoers`. Configure OpenCode to ask before using `ssh-mcp` tools; do not add broad auto-allow rules.
+The default policy file is `~/.config/ssh-mcp-policy/policy.json`. The sudo allowlist is empty by default. To allow any single sudo command through `ssh_sudo_exec`, set `"sudo_commands": ["*"]`; the full executable path is still required, such as `/usr/bin/systemctl` instead of `systemctl`, and shell chaining and detected destructive commands remain blocked. This requires remote `NOPASSWD: ALL`, which grants the SSH account the same privilege outside MCP as well. Configure your MCP client to ask before every tool call; avoid broad auto-allow rules.
 
 ## Tests
 
 ```bash
-uv run --extra test --with pytest python -m unittest discover -s tests -v
+python3 -m pip install -e ".[test]" build
+python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-uv run --with build python -m build
+python3 -m build
 ```
 
-For the upstream tools' full parameter reference, see the [upstream README](https://github.com/slepp/ssh-mcp). This project is MIT licensed; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+MIT licensed; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -88,6 +88,22 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(PolicyViolation, "absolute path"):
             policy.authorize_sudo_exec("apt-get update")
 
+    def test_sudo_exec_wildcard_allows_any_single_absolute_command(self) -> None:
+        policy = Policy(sudo_allowed_commands=["*"])
+        self.assertEqual(policy.authorize_sudo_exec("/usr/bin/systemctl restart example.service"), [
+            "/usr/bin/systemctl", "restart", "example.service"
+        ])
+        with self.assertRaisesRegex(PolicyViolation, "absolute path"):
+            policy.authorize_sudo_exec("systemctl restart example.service")
+        with self.assertRaisesRegex(PolicyViolation, "shell operators"):
+            policy.authorize_sudo_exec("/usr/bin/systemctl restart x && /usr/bin/id")
+        with self.assertRaisesRegex(PolicyViolation, "destructive command"):
+            policy.authorize_sudo_exec("/usr/bin/rm -rf /tmp/example")
+
+    def test_sudo_wildcard_must_be_the_only_allowlist_entry(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be the only"):
+            Policy(sudo_allowed_commands=["*", "/usr/bin/id"])
+
     def test_normal_session_blocks_privilege_and_delete_commands(self) -> None:
         policy = Policy()
         for command in ("sudo apt-get update\n", "rm -rf ~/cache\n", "find /tmp -delete\n"):

@@ -222,8 +222,13 @@ class Policy:
             raw_specs = _default_sudo_commands()
         else:
             raw_specs = configured_sudo
+        if "*" in raw_specs and len(raw_specs) != 1:
+            raise ValueError("sudo command wildcard '*' must be the only sudo_commands entry")
+        self.allow_any_sudo_command = raw_specs == ["*"] or raw_specs == ("*",)
         parsed_specs: list[tuple[str, ...]] = []
         for spec in raw_specs:
+            if spec == "*":
+                continue
             try:
                 tokens = shlex.split(spec, posix=True)
             except ValueError as exc:
@@ -265,7 +270,9 @@ class Policy:
         if not executable.startswith("/"):
             raise PolicyViolation("sudo executable must use an absolute path")
         tokens[0] = executable
-        if not any(tokens[: len(spec)] == list(spec) for spec in self.sudo_allowed_commands):
+        if not self.allow_any_sudo_command and not any(
+            tokens[: len(spec)] == list(spec) for spec in self.sudo_allowed_commands
+        ):
             allowed = "; ".join(shlex.join(spec) for spec in self.sudo_allowed_commands) or "none configured"
             raise PolicyViolation(
                 f"sudo command {shlex.join(tokens)!r} is not allowed; configured command prefixes: {allowed}. "
