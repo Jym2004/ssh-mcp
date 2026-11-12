@@ -63,12 +63,11 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(destructive_reason(command), expected)
 
-    def test_exec_policy_separates_sudo_and_delete_tools(self) -> None:
+    def test_exec_policy_leaves_command_approval_to_the_mcp_client(self) -> None:
         policy = Policy()
-        with self.assertRaisesRegex(PolicyViolation, "ssh_sudo_exec"):
-            policy.check_exec("sudo apt-get update")
-        with self.assertRaisesRegex(PolicyViolation, "ssh_delete"):
-            policy.check_exec("rm -rf ~/cache")
+        policy.check_exec("sudo apt-get update")
+        policy.check_exec("rm -rf ~/cache")
+        policy.check_exec("/usr/bin/sed -e 's/a/b/;s/c/d/' file")
         policy.check_exec("python train.py")
 
     def test_sudo_exec_requires_an_explicit_command_prefix(self) -> None:
@@ -81,10 +80,14 @@ class PolicyTests(unittest.TestCase):
             policy.authorize_sudo_exec("/usr/bin/apt-get install -y python3-dev"),
             ["/usr/bin/apt-get", "install", "-y", "python3-dev"],
         )
-        with self.assertRaisesRegex(PolicyViolation, "not allowed"):
-            policy.authorize_sudo_exec("/usr/bin/apt-get autoremove -y")
-        with self.assertRaisesRegex(PolicyViolation, "shell operators"):
-            policy.authorize_sudo_exec("/usr/bin/apt-get update && /usr/bin/apt-get install x")
+        self.assertEqual(
+            policy.authorize_sudo_exec("/usr/bin/apt-get autoremove -y"),
+            ["/usr/bin/apt-get", "autoremove", "-y"],
+        )
+        self.assertEqual(
+            policy.authorize_sudo_exec("/usr/bin/sed -e 's/a/b/;s/c/d/' file"),
+            ["/usr/bin/sed", "-e", "s/a/b/;s/c/d/", "file"],
+        )
         with self.assertRaisesRegex(PolicyViolation, "absolute path"):
             policy.authorize_sudo_exec("apt-get update")
 
@@ -95,30 +98,33 @@ class PolicyTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(PolicyViolation, "absolute path"):
             policy.authorize_sudo_exec("systemctl restart example.service")
-        with self.assertRaisesRegex(PolicyViolation, "shell operators"):
-            policy.authorize_sudo_exec("/usr/bin/systemctl restart x && /usr/bin/id")
-        with self.assertRaisesRegex(PolicyViolation, "destructive command"):
-            policy.authorize_sudo_exec("/usr/bin/rm -rf /tmp/example")
+        self.assertEqual(
+            policy.authorize_sudo_exec("/usr/bin/systemctl restart x && /usr/bin/id"),
+            ["/usr/bin/systemctl", "restart", "x", "&&", "/usr/bin/id"],
+        )
+        self.assertEqual(
+            policy.authorize_sudo_exec("/usr/bin/rm -rf /tmp/example"),
+            ["/usr/bin/rm", "-rf", "/tmp/example"],
+        )
 
-    def test_sudo_wildcard_must_be_the_only_allowlist_entry(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must be the only"):
-            Policy(sudo_allowed_commands=["*", "/usr/bin/id"])
-
-    def test_normal_session_blocks_privilege_and_delete_commands(self) -> None:
+    def test_normal_session_allows_commands_for_per_call_approval(self) -> None:
         policy = Policy()
-        for command in ("sudo apt-get update\n", "rm -rf ~/cache\n", "find /tmp -delete\n"):
-            with self.subTest(command=command), self.assertRaises(PolicyViolation):
+        for command in (
+            "sudo apt-get update\n",
+            "rm -rf ~/cache\n",
+            "find /tmp -delete\n",
+            "sed -e 's/a/b/;s/c/d/' file\n",
+        ):
+            with self.subTest(command=command):
                 policy.check_session_input(command, mode="safe")
         policy.check_session_input("python train.py\n", mode="safe")
 
-    def test_admin_session_routes_sudo_and_delete_to_separate_tools(self) -> None:
+    def test_admin_session_allows_commands_for_per_call_approval(self) -> None:
         policy = Policy()
-        with self.assertRaisesRegex(PolicyViolation, "ssh_admin_sudo_session_write"):
-            policy.check_session_input("sudo apt-get update\n", mode="admin")
-        with self.assertRaisesRegex(PolicyViolation, "ssh_delete"):
-            policy.check_session_input("sudo rm -rf ~/cache\n", mode="admin")
-        with self.assertRaisesRegex(PolicyViolation, "shell chaining"):
-            policy.check_session_input("sudo apt-get update && sudo apt-get install -y x\n", mode="admin")
+        policy.check_session_input("sudo apt-get update\n", mode="admin")
+        policy.check_session_input("sudo rm -rf ~/cache\n", mode="admin")
+        policy.check_session_input("sed -e 's/a/b/;s/c/d/' file\n", mode="admin")
+        policy.check_session_input("sudo apt-get update && sudo apt-get install -y x\n", mode="admin")
 
     def test_guarded_session_requires_complete_single_line_input(self) -> None:
         policy = Policy()
@@ -128,21 +134,20 @@ class PolicyTests(unittest.TestCase):
             policy.check_session_input("pwd\nls\n", mode="safe")
         policy.check_session_input("y\n", mode="admin")
 
-    def test_admin_session_sudo_is_only_allowed_through_the_sudo_tool(self) -> None:
+    def test_admin_session_sudo_tool_parses_multi_expression_sed(self) -> None:
         policy = Policy(sudo_allowed_commands=["/usr/bin/apt-get install"])
-        with self.assertRaisesRegex(PolicyViolation, "ssh_admin_sudo_session_write"):
-            policy.check_session_input("sudo /usr/bin/apt-get install -y python3-dev\n", mode="admin")
+        policy.check_session_input("sudo /usr/bin/apt-get install -y python3-dev\n", mode="admin")
         self.assertEqual(
-            policy.authorize_sudo_exec("/usr/bin/apt-get install -y python3-dev"),
-            ["/usr/bin/apt-get", "install", "-y", "python3-dev"],
+            policy.authorize_sudo_exec("/usr/bin/sed -e 's/a/b/;s/c/d/' file"),
+            ["/usr/bin/sed", "-e", "s/a/b/;s/c/d/", "file"],
         )
 
-    def test_delete_roots_require_literal_non_root_paths(self) -> None:
+    def test_delete_paths_require_absolute_or_home_paths(self) -> None:
         policy = Policy()
-        for path in ("/", "/etc/passwd", "/home/example", "~/", "~/project/*", "../etc/passwd", "relative/path"):
+        for path in ("", "../etc/passwd", "relative/path", "bad\npath"):
             with self.subTest(path=path), self.assertRaises(PolicyViolation):
                 policy.check_delete_paths([path])
-        policy.check_delete_paths(["~/projects/cache", "/data/old-run"])
+        policy.check_delete_paths(["/etc/passwd", "~/projects/cache", "/data/old-run", "/"])
 
     def test_delete_command_quotes_paths_and_uses_option_terminator(self) -> None:
         command = build_delete_command(["~/project/my data", "/data/old-run"], recursive=True)

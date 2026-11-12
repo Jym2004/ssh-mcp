@@ -6,10 +6,9 @@
 
 ## 新增功能
 
-- `ssh_exec` 和普通会话拦截常见 sudo、删除命令。
-- `ssh_sudo_exec` 只运行通过本地策略检查的命令，使用 `sudo -n`，不通过 MCP 传递密码；命令要写完整程序位置，例如 `/usr/bin/systemctl`，不能只写 `systemctl`。
-- `ssh_delete` 默认只预览；实际删除必须同时设置 `dry_run=false` 和 `confirm=true`，且路径必须位于配置的删除根目录内。
-- 管理会话、会话 sudo 和固定终端按键使用独立工具；`ssh_sync` 禁止 rsync `--delete`。
+- `ssh_exec`、交互会话、sudo 和同步操作不再按危险命令内容硬拒绝；MCP 客户端应在每次工具调用前询问，并展示完整命令和路径。
+- `ssh_sudo_exec` 使用 `sudo -n`，不通过 MCP 传递密码。命令要写完整程序位置，例如 `/usr/bin/systemctl`，不能只写 `systemctl`。
+- `ssh_delete` 默认只预览；实际删除仍必须同时设置 `dry_run=false` 和 `confirm=true`。`ssh_sync` 的 `delete=true` 会执行 rsync 删除。
 
 这些策略是防护栏，不是 shell 沙箱。SSH 账号仍拥有其远程权限；请使用受限账号，并在服务器端配置匹配的 `sudoers` 规则。
 
@@ -27,13 +26,10 @@ python3 -m venv .venv
 ## 安全默认值
 
 ```json
-{
-  "delete_roots": ["~/projects/", "~/scratch/"],
-  "sudo_commands": []
-}
+{}
 ```
 
-配置文件默认位于 `~/.config/ssh-mcp-policy/policy.json`。sudo 白名单默认留空。若明确要允许 `ssh_sudo_exec` 执行任意单条 sudo 命令，可设置 `"sudo_commands": ["*"]`；仍要求写完整程序位置，例如 `/usr/bin/systemctl`，并拒绝 shell 拼接和识别到的破坏性命令。此选项需远端账号已配置 `NOPASSWD: ALL`，而且远端账号在 MCP 之外也会拥有该权限。MCP 客户端应在每次调用工具前询问批准，不要配置宽泛的自动允许规则。
+MCP 客户端必须把 `ssh-mcp` 工具权限设为每次询问（`ask`）。批准某次调用只代表允许本次请求，不会建立一次性远端 root 权限；远端 `NOPASSWD: ALL` 仍会让 SSH 账号在 MCP 之外也能免密 sudo。策略会检查参数格式，但不再用命令黑名单替代用户审批。
 
 ## 测试
 

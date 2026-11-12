@@ -6,10 +6,10 @@ A policy-focused fork of [slepp/ssh-mcp](https://github.com/slepp/ssh-mcp). It k
 
 ## Added features
 
-- `ssh_exec` and normal sessions block common sudo and destructive commands.
-- `ssh_sudo_exec` runs commands that pass the local policy, using `sudo -n`; no sudo password is sent through MCP. The command must include the full executable path, such as `/usr/bin/systemctl`, not just `systemctl`.
-- `ssh_delete` previews by default. Actual deletion requires both `dry_run=false` and `confirm=true`, and the path must be under a configured delete root.
-- Admin sessions, session sudo, and fixed terminal keys use separate tools. `ssh_sync` rejects rsync `--delete`.
+- `ssh_exec`, interactive sessions, sudo, and sync no longer hard-block commands based on their content. The MCP client should ask before each call and show the complete command and paths.
+- `ssh_sudo_exec` uses `sudo -n`; no sudo password is sent through MCP. Include the full executable path, such as `/usr/bin/systemctl`, not just `systemctl`.
+- `ssh_delete` previews by default; actual deletion still requires both `dry_run=false` and `confirm=true`. `ssh_sync` executes rsync deletion when `delete=true`.
+- Admin sessions, session sudo, and fixed terminal keys use separate tools.
 
 These policies are guardrails, not a shell sandbox. SSH commands retain the remote account's permissions. Use a restricted account and matching server-side `sudoers` rules.
 
@@ -27,13 +27,10 @@ Add a local stdio server to your MCP client: set the command to `.venv/bin/ssh-m
 ## Security defaults
 
 ```json
-{
-  "delete_roots": ["~/projects/", "~/scratch/"],
-  "sudo_commands": []
-}
+{}
 ```
 
-The default policy file is `~/.config/ssh-mcp-policy/policy.json`. The sudo allowlist is empty by default. To allow any single sudo command through `ssh_sudo_exec`, set `"sudo_commands": ["*"]`; the full executable path is still required, such as `/usr/bin/systemctl` instead of `systemctl`, and shell chaining and detected destructive commands remain blocked. This requires remote `NOPASSWD: ALL`, which grants the SSH account the same privilege outside MCP as well. Configure your MCP client to ask before every tool call; avoid broad auto-allow rules.
+Configure your MCP client to ask (`ask`) before every `ssh-mcp` tool call. Approval allows that call only; it does not create a one-time remote root privilege. Remote `NOPASSWD: ALL` still lets the SSH account use passwordless sudo outside MCP. The policy validates argument structure but does not use a command blacklist in place of user approval.
 
 ## Tests
 

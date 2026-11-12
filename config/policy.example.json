@@ -1,7 +1,1 @@
-{
-  "delete_roots": [
-    "~/projects/",
-    "~/scratch/"
-  ],
-  "sudo_commands": []
-}
+{}

@@ -91,7 +91,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "ssh_exec",
         "description": (
             "Run a one-off remote SSH command and return stdout, stderr, and exit metadata. "
-            "The command runs in a non-interactive context. Use 'cwd' and 'env' for remote "
+            "The command runs in a non-interactive context and is approval-gated by the MCP client. "
+            "Use 'cwd' and 'env' for remote "
             "directory and environment setup (requires a POSIX shell on the remote). "
             "For interactive or long-running commands, use ssh_ensure_session instead."
         ),
@@ -163,7 +164,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "ssh_sync",
-        "description": "Incrementally sync files or directories between the local machine and one remote target via local rsync over SSH.",
+        "description": "Approval-gated sync between the local machine and one remote target via rsync over SSH. Review source, destination, and delete behavior before approving.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -179,7 +180,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "For upload: remote path. For download: local path.",
                 },
-                "delete": {"type": "boolean", "description": "Delete files in the destination that are not in the source."},
+                "delete": {"type": "boolean", "description": "Also delete destination files absent from the source. Review both paths and approve this destructive call carefully."},
                 "compress": {"type": "boolean", "description": "Compress data during transfer. Default: true."},
                 "dry_run": {"type": "boolean", "description": "Show what would be transferred without actually doing it."},
                 "exclude": {"type": "array", "items": {"type": "string"}, "description": "Glob patterns to exclude from the sync."},
@@ -376,8 +377,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "ssh_start_session",
         "description": (
-            "Start a normal-policy interactive SSH session backed by a local PTY. "
-            "Common sudo and destructive commands are blocked on input. "
+            "Start an approval-gated interactive SSH session backed by a local PTY. "
+            "Each session input call should be reviewed by the MCP client. "
             "Returns the session id, initial output, and observer metadata. "
             "If 'truncated' is true or 'pending_output_chars' > 0 in the response, "
             "call ssh_read_session to retrieve the remaining buffered output. "
@@ -495,8 +496,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "ssh_write_session",
         "description": (
-            "Write text or a control sequence to a normal-policy SSH session PTY. "
-            "Common sudo and destructive commands are blocked; use ssh_sudo_exec or ssh_delete instead. "
+            "Write text or a control sequence to an approval-gated SSH session PTY. "
+            "Review each call before submitting it to the remote shell. "
             "Always terminate commands with a trailing newline (\\n) to submit them. "
             "Control characters: \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, \\u001a for Ctrl-Z. "
             "Use wait_seconds (e.g. 1-5) to receive the command response in the same call. "
@@ -642,21 +643,22 @@ def _clone_tool_definition(base_name: str, name: str, description: str) -> dict[
 _sudo_exec_tool = _clone_tool_definition(
     "ssh_exec",
     "ssh_sudo_exec",
-    "Run one approval-gated sudo executable. Uses sudo -n and requires an absolute executable path. Shell operators and destructive commands are rejected. The command must match SSH_MCP_SUDO_COMMANDS, or that setting must be ['*'] to allow any single command that passes these checks.",
+    "Run one approval-gated sudo executable. Uses sudo -n and requires an absolute executable path. Review the complete command before approving it.",
 )
 _sudo_exec_properties = _sudo_exec_tool["inputSchema"]["properties"]
 for _key in ("cwd", "env", "shell", "tty"):
     _sudo_exec_properties.pop(_key, None)
 _sudo_exec_properties["command"]["description"] = (
     "Write the full program location followed by arguments, e.g. /usr/bin/apt-get update "
-    "instead of apt-get update. Shell operators, pipelines, and destructive commands are rejected."
+    "instead of apt-get update. Review the complete command before approving it."
 )
 
 _delete_tool: dict[str, Any] = {
     "name": "ssh_delete",
     "description": (
-        "Delete literal paths under approved data roots. Defaults to dry-run; actual deletion "
-        "requires both dry_run=false and confirm=true. System roots and glob paths are rejected."
+        "Delete literal remote paths. The MCP client should ask before this call. "
+        "Defaults to dry-run; actual deletion requires both dry_run=false and confirm=true. "
+        "Review every path and recursive setting before approval."
     ),
     "inputSchema": {
         "type": "object",
@@ -668,7 +670,7 @@ _delete_tool: dict[str, Any] = {
                 "type": "array",
                 "minItems": 1,
                 "items": {"type": "string"},
-                "description": "Literal absolute paths or paths under ~/; globs and protected roots are rejected.",
+                "description": "Absolute paths or paths under ~/. Review each path carefully before approving deletion.",
             },
             "recursive": {"type": "boolean", "description": "Recursively remove directories. Default: false."},
             "dry_run": {"type": "boolean", "description": "Preview only. Default: true."},
@@ -686,7 +688,7 @@ _delete_tool: dict[str, Any] = {
 _admin_session_start_tool = _clone_tool_definition(
     "ssh_start_session",
     "ssh_admin_session_start",
-    "Start an explicitly privileged interactive SSH session. Sudo is permitted, while common destructive commands and shell chaining are blocked by best-effort input checks. This is not a sandbox; enforce privilege limits with remote sudoers.",
+    "Start an explicitly privileged, approval-gated interactive SSH session. Each input call should be reviewed. This is not a sandbox; enforce privilege limits with remote sudoers.",
 )
 _admin_session_ensure_tool = _clone_tool_definition(
     "ssh_ensure_session",
@@ -699,14 +701,13 @@ _admin_session_write_tool = _clone_tool_definition(
     "Write input to an explicitly privileged SSH session. Each call should be reviewed; the session can run arbitrary commands.",
 )
 _admin_session_write_tool["description"] += (
-    " Sudo and destructive commands are rejected; use the separate sudo-write or delete tool. Send one reviewed command or response per call."
+    " Send one reviewed command or response per call."
 )
 _admin_sudo_write_tool: dict[str, Any] = {
     "name": "ssh_admin_sudo_session_write",
     "description": (
         "Run one approved sudo executable in an admin PTY session. It uses sudo -n and "
-        "requires the command prefix to match SSH_MCP_SUDO_COMMANDS, unless that setting is ['*']. "
-        "This is a distinct tool "
+        "Review the complete command before approving it. This is a distinct tool "
         "so the MCP client can request a separate approval."
     ),
     "inputSchema": {
@@ -715,7 +716,7 @@ _admin_sudo_write_tool: dict[str, Any] = {
         "required": ["session_id", "command"],
         "properties": {
             "session_id": {"type": "string"},
-            "command": {"type": "string", "description": "One absolute executable path and its arguments; shell operators are rejected."},
+            "command": {"type": "string", "description": "One absolute executable path and its arguments; review the complete command before approving it."},
             "wait_seconds": {"type": "number", "minimum": 0},
             "max_output_chars": {"type": "integer", "minimum": 1},
         },

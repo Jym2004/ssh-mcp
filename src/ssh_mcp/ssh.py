@@ -850,11 +850,9 @@ _REMOTE_DELETE_SCRIPT = r"""
 set -eu
 recursive=$1
 dry_run=$2
-root_count=$3
-shift 3
-roots_file=$(mktemp)
+shift 2
 targets_file=$(mktemp)
-trap 'rm -f "$roots_file" "$targets_file"' EXIT HUP INT TERM
+trap 'rm -f "$targets_file"' EXIT HUP INT TERM
 
 expand_home() {
     case "$1" in
@@ -864,52 +862,17 @@ expand_home() {
     esac
 }
 
-i=0
-while [ "$i" -lt "$root_count" ]; do
-    raw_root=$1
-    shift
-    i=$((i + 1))
-    root=$(expand_home "$raw_root")
-    canonical_root=$(realpath -e -- "$root" 2>/dev/null || true)
-    if [ -n "$canonical_root" ] && [ "$canonical_root" != "/" ]; then
-        printf '%s\n' "$canonical_root" >> "$roots_file"
-    fi
-done
-
-if [ ! -s "$roots_file" ]; then
-    echo "delete denied: no configured delete roots exist on the remote host" >&2
-    exit 4
-fi
-
 for raw_path in "$@"; do
     path=$(expand_home "$raw_path")
     case "$path" in
         /*) ;;
         *) echo "delete denied: path is not absolute: $raw_path" >&2; exit 4 ;;
     esac
-    if [ -L "$path" ]; then
-        echo "delete denied: refusing a symlink target: $raw_path" >&2
-        exit 4
-    fi
-    canonical_path=$(realpath -e -- "$path" 2>/dev/null) || {
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
         echo "delete denied: path does not exist or cannot be resolved: $raw_path" >&2
         exit 4
-    }
-    allowed=0
-    while IFS= read -r root; do
-        if [ "$canonical_path" = "$root" ]; then
-            echo "delete denied: refusing to delete an allowed root itself: $raw_path" >&2
-            exit 4
-        fi
-        case "$canonical_path" in
-            "$root"/*) allowed=1 ;;
-        esac
-    done < "$roots_file"
-    if [ "$allowed" -ne 1 ]; then
-        echo "delete denied: resolved path is outside allowed roots: $raw_path" >&2
-        exit 4
     fi
-    printf '%s\n' "$canonical_path" >> "$targets_file"
+    printf '%s\n' "$path" >> "$targets_file"
 done
 
 if [ "$dry_run" = "1" ]; then
@@ -2123,8 +2086,6 @@ class SshToolService:
             [
                 "1" if recursive else "0",
                 "1" if effective_dry_run else "0",
-                str(len(self._policy.delete_roots)),
-                *self._policy.delete_roots,
                 *paths,
             ],
             timeout=timeout,
@@ -2135,10 +2096,8 @@ class SshToolService:
         result["recursive"] = recursive
         result["command"] = command
         result["dry_run"] = effective_dry_run
-        if result["exit_code"] == 4 and str(result.get("stderr", "")).startswith("delete denied:"):
-            raise PolicyViolation(str(result["stderr"]).strip())
         if effective_dry_run and result["ok"]:
-            result["message"] = "No files were deleted; remote canonical paths were validated."
+            result["message"] = "No files were deleted; the requested paths were checked."
         return result
 
     def ssh_scp(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
