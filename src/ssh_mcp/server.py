@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -412,7 +414,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "number",
                     "minimum": 0,
-                    "description": "Seconds to wait for initial output. Default: 1.0.",
+                    "description": "Maximum seconds to wait for initial output. Returns early after output settles briefly. Default: 1.0.",
                 },
                 "max_output_chars": {"type": "integer", "minimum": 1},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
@@ -431,6 +433,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "session_name so the session can be reliably found across tool calls and conversations. "
             "When a session is reused (reused=true in response), the cwd, env, and shell "
             "parameters are ignored — they only apply when creating a new session. "
+            "Reused sessions return buffered output immediately without waiting for new output. "
             "Check 'created' vs 'reused' in the response to know which happened."
         ),
         "inputSchema": {
@@ -458,7 +461,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "number",
                     "minimum": 0,
-                    "description": "Seconds to wait for initial output. Default: 1.0.",
+                    "description": "Maximum seconds to wait for initial output of a new session. Reused sessions do not wait. Default: 1.0.",
                 },
                 "max_output_chars": {"type": "integer", "minimum": 1},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
@@ -473,8 +476,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "ssh_read_session",
         "description": (
             "Read unread output from a tracked SSH session. "
-            "Set wait_seconds (e.g. 1-10) to block until new output arrives; "
+            "Set wait_seconds (e.g. 1-10) as an upper bound for new output; "
             "0 returns immediately with whatever is buffered right now. Default: 1.0. "
+            "New output returns after a brief quiet interval, not necessarily command completion. "
             "If 'truncated' is true or 'pending_output_chars' > 0, call again to drain remaining output. "
             "Check 'running' to know whether the session is still alive."
         ),
@@ -487,7 +491,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "number",
                     "minimum": 0,
-                    "description": "Seconds to wait for new output. Default: 1.0. Set higher (5-10) for slow commands. Set 0 for instant polling.",
+                    "description": "Maximum seconds to wait for new output. Returns early after output settles briefly. Zero returns buffered output immediately. Default: 1.0.",
                 },
                 "max_output_chars": {"type": "integer", "minimum": 1},
             },
@@ -500,7 +504,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Review each call before submitting it to the remote shell. "
             "Always terminate commands with a trailing newline (\\n) to submit them. "
             "Control characters: \\u0003 for Ctrl-C, \\u0004 for Ctrl-D, \\u001a for Ctrl-Z. "
-            "Use wait_seconds (e.g. 1-5) to receive the command response in the same call. "
+            "Use wait_seconds (e.g. 1-5) as an upper bound for new output. Early output does not mean the command finished. "
             "Check 'pending_output_chars' in the response; if non-zero, call ssh_read_session to drain."
         ),
         "inputSchema": {
@@ -520,7 +524,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "number",
                     "minimum": 0,
-                    "description": "Seconds to wait for output after writing. Default: 1.0.",
+                    "description": "Maximum seconds to wait for output after writing. Returns early after output settles briefly, not necessarily command completion. Default: 1.0.",
                 },
                 "max_output_chars": {"type": "integer", "minimum": 1},
             },
@@ -693,7 +697,7 @@ _admin_session_start_tool = _clone_tool_definition(
 _admin_session_ensure_tool = _clone_tool_definition(
     "ssh_ensure_session",
     "ssh_admin_session_ensure",
-    "Reuse or start an explicitly privileged interactive session. Sudo commands must use ssh_admin_sudo_session_write; approve this tool only when the admin session is needed.",
+    "Reuse or start an explicitly privileged interactive session. Reused sessions return buffered output without waiting. Review each input call; approve this tool only when the admin session is needed.",
 )
 _admin_session_write_tool = _clone_tool_definition(
     "ssh_write_session",
@@ -717,7 +721,7 @@ _admin_sudo_write_tool: dict[str, Any] = {
         "properties": {
             "session_id": {"type": "string"},
             "command": {"type": "string", "description": "One absolute executable path and its arguments; review the complete command before approving it."},
-            "wait_seconds": {"type": "number", "minimum": 0},
+            "wait_seconds": {"type": "number", "minimum": 0, "description": "Maximum output wait, default 1 second. Returns early after a brief quiet interval, not necessarily command completion."},
             "max_output_chars": {"type": "integer", "minimum": 1},
         },
     },
@@ -768,6 +772,7 @@ class McpServer:
         self._stdout = stdout or sys.stdout.buffer
         self._tool_service = tool_service or SshToolService()
         self._initialized = False
+        self._output_lock = threading.Lock()
         self._tool_handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
             "ssh_exec": self._tool_service.ssh_exec,
             "ssh_sudo_exec": self._tool_service.ssh_sudo_exec,
@@ -797,28 +802,47 @@ class McpServer:
 
     def serve(self) -> None:
         try:
-            while True:
-                line = self._stdin.readline()
-                if not line:
-                    break
-                if not line.strip():
-                    continue
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    self._write_message(
-                        _jsonrpc_error(
-                            JSONRPC_PARSE_ERROR,
-                            f"Invalid JSON: {exc.msg}",
-                            request_id=None,
+            # Lifecycle and cheap metadata requests stay on the reader thread.
+            # Tool calls can complete out of order, correlated by JSON-RPC id.
+            # Drain accepted work before closing sessions/forwards on EOF.
+            with ThreadPoolExecutor(max_workers=8, thread_name_prefix="mcp-tool") as workers:
+                while True:
+                    line = self._stdin.readline()
+                    if not line:
+                        break
+                    if not line.strip():
+                        continue
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        self._write_message(
+                            _jsonrpc_error(
+                                JSONRPC_PARSE_ERROR,
+                                f"Invalid JSON: {exc.msg}",
+                                request_id=None,
+                            )
                         )
+                        continue
+                    params = message.get("params") if isinstance(message, dict) else None
+                    is_tool_call = (
+                        isinstance(message, dict)
+                        and message.get("method") == "tools/call"
+                        and self._initialized
                     )
-                    continue
-                response = self._handle_message(message)
-                if response is not None:
-                    self._write_message(response)
+                    is_listing = isinstance(params, dict) and params.get("name") in {
+                        "ssh_list_sessions", "ssh_list_forwards",
+                    }
+                    if is_tool_call and not is_listing:
+                        workers.submit(self._respond, message)
+                    else:
+                        self._respond(message)
         finally:
             self._tool_service.close()
+
+    def _respond(self, message: Any) -> None:
+        response = self._handle_message(message)
+        if response is not None:
+            self._write_message(response)
 
     def _handle_message(self, message: Any) -> dict[str, Any] | None:
         if not isinstance(message, dict):
@@ -960,8 +984,9 @@ class McpServer:
 
     def _write_message(self, message: Mapping[str, Any]) -> None:
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self._stdout.write(encoded + b"\n")
-        self._stdout.flush()
+        with self._output_lock:
+            self._stdout.write(encoded + b"\n")
+            self._stdout.flush()
 
 
 class JsonRpcRequestError(Exception):

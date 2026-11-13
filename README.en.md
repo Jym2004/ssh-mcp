@@ -24,6 +24,8 @@ python3 -m venv .venv
 
 Add a local stdio server to your MCP client: set the command to `.venv/bin/ssh-mcp-policy` and leave arguments empty. See the [upstream README](https://github.com/slepp/ssh-mcp) for the upstream tools' parameter reference.
 
+Prefer `ssh_exec` for short commands. Session `wait_seconds` is an upper bound: new output returns after a brief quiet interval, which does not mean the command has finished; read again for later output. Reusing a session returns buffered output immediately. Independent tool calls run concurrently and replies match request IDs. Reads and writes on one session are serialized; session listings and ping are not queued behind long tool calls. `ssh_edit` can edit different files concurrently; edits to the same SSH target, port, and path are serialized to prevent lost updates.
+
 ## Security defaults
 
 ```json

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -331,6 +334,74 @@ class StdioServerTests(unittest.TestCase):
         self.assertEqual(len(log_entries), 2)
         self.assertEqual(log_entries[0]["argv"][:3], ["new-session", "-d", "-s"])
         self.assertEqual(log_entries[1]["argv"][:2], ["kill-session", "-t"])
+
+    def test_waiting_session_read_does_not_block_listing_or_ping(self) -> None:
+        self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        started = self._rpc({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "ssh_start_session", "arguments": {
+                "target": "example", "observer_mode": "transcript", "wait_seconds": 0.1,
+            }},
+        })["result"]["structuredContent"]
+        replies: queue.Queue = queue.Queue()
+
+        def collect_replies() -> None:
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                replies.put(json.loads(line))
+
+        reader = threading.Thread(target=collect_replies, daemon=True)
+        reader.start()
+        assert self.process.stdin is not None
+        messages = [
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "ssh_read_session", "arguments": {
+                    "session_id": started["session_id"], "wait_seconds": 1.5,
+                },
+            }},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                "name": "ssh_list_sessions", "arguments": {},
+            }},
+            {"jsonrpc": "2.0", "id": 5, "method": "ping"},
+        ]
+        began_at = time.monotonic()
+        self.process.stdin.write("".join(json.dumps(message) + "\n" for message in messages))
+        self.process.stdin.flush()
+        try:
+            first = replies.get(timeout=1)
+            second = replies.get(timeout=1)
+            self.assertEqual({first["id"], second["id"]}, {4, 5})
+            self.assertLess(time.monotonic() - began_at, 1.0)
+            listing = first if first["id"] == 4 else second
+            self.assertEqual(listing["result"]["structuredContent"]["count"], 1)
+            self.assertEqual(replies.get(timeout=3)["id"], 3)
+        finally:
+            self.process.stdin.close()
+            self.process.wait(timeout=4)
+            reader.join(timeout=2)
+
+    def test_parallel_tool_responses_stay_intact_and_drain_before_shutdown(self) -> None:
+        self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        assert self.process.stdin is not None
+        assert self.process.stdout is not None
+        messages = [
+            {"jsonrpc": "2.0", "id": index, "method": "tools/call", "params": {
+                "name": "ssh_exec", "arguments": {
+                    "target": "example", "command": "printf '%s' '" + (f"result-{index}-α" * 2048) + "'",
+                },
+            }}
+            for index in range(2, 10)
+        ]
+        self.process.stdin.write("".join(json.dumps(message) + "\n" for message in messages))
+        self.process.stdin.close()
+        replies = [json.loads(line) for line in self.process.stdout]
+        self.process.wait(timeout=4)
+        self.assertEqual(self.process.returncode, 0)
+        self.assertEqual({reply["id"] for reply in replies}, set(range(2, 10)))
+        self.assertEqual(len(replies), 8)
+        for reply in replies:
+            self.assertFalse(reply["result"]["isError"])
+            self.assertEqual(reply["result"]["structuredContent"]["stdout"], f"result-{reply['id']}-α" * 2048)
 
     def test_stdio_forward_round_trip(self) -> None:
         self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})

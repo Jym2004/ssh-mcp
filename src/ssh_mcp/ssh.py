@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import errno
 import os
+import posixpath
 import re
 import select
 import shlex
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -29,6 +31,8 @@ DEFAULT_SESSION_START_WAIT_SECONDS = 1.0
 DEFAULT_SESSION_READ_WAIT_SECONDS = 1.0
 DEFAULT_SESSION_WRITE_WAIT_SECONDS = 1.0
 DEFAULT_SESSION_STOP_WAIT_SECONDS = 2.0
+# Coalesce adjacent PTY chunks without waiting out the caller's full deadline.
+SESSION_OUTPUT_QUIET_SECONDS = 0.05
 DEFAULT_VIEW_MAX_BYTES = 20_480  # 20 KiB, matches the local file-viewing tool's cutoff.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_STRICT_HOST_KEY_CHECKING = {"yes", "no", "ask", "accept-new", "off"}
@@ -1357,6 +1361,9 @@ class SshSession:
         self._master_closed = False
         self._auto_close = auto_close
         self._condition = threading.Condition()
+        # Reads consume a shared stream. Serialize read/write exchanges, but
+        # leave summary/stop and the background PTY reader free to run.
+        self._io_lock = threading.RLock()
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._unread_output = ""
         self._unread_dropped_chars = 0
@@ -1683,26 +1690,42 @@ class SshSession:
         wait_seconds: float,
         max_output_chars: int,
         wait_for_new: bool = False,
+        after_output_chars: int | None = None,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + wait_seconds
-        with self._condition:
+        with self._io_lock, self._condition:
+            deadline = time.monotonic() + wait_seconds
             self._update_process_status_locked()
             had_buffered_output = bool(self._unread_output) and not wait_for_new
+            baseline = self._total_output_chars if after_output_chars is None else after_output_chars
             while True:
                 self._update_process_status_locked()
                 if had_buffered_output and self._unread_output:
                     break
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = deadline - now
                 # Break on timeout, EOF, or process exit (poll() may return
                 # before the reader thread has set _eof).
                 if remaining <= 0 or self._eof or self.process.poll() is not None:
                     break
+                if self._unread_output and self._total_output_chars > baseline:
+                    # A quiet interval collects a short burst (e.g. echo,
+                    # result, prompt) without claiming the command is done.
+                    quiet_remaining = SESSION_OUTPUT_QUIET_SECONDS - (now - self._last_output_mono)
+                    if quiet_remaining <= 0 or len(self._unread_output) >= max_output_chars:
+                        break
+                    remaining = min(remaining, quiet_remaining)
                 self._condition.wait(timeout=min(remaining, 0.1))
             output, truncated = self._pop_output_locked(max_output_chars)
             self._update_process_status_locked()
             return self._snapshot_locked(output=output, truncated=truncated)
 
     def write(self, *, input_text: str, wait_seconds: float, max_output_chars: int) -> dict[str, Any]:
+        with self._io_lock:
+            return self._write_locked(
+                input_text=input_text, wait_seconds=wait_seconds, max_output_chars=max_output_chars,
+            )
+
+    def _write_locked(self, *, input_text: str, wait_seconds: float, max_output_chars: int) -> dict[str, Any]:
         if not isinstance(input_text, str):
             raise ValidationError("'input' must be a string.")
         payload = input_text.encode("utf-8")
@@ -1720,6 +1743,7 @@ class SshSession:
             if self._master_closed:
                 raise ValidationError(f"Session '{self.session_id}' is not writable anymore.")
             master_fd = self._master_fd
+            output_before_write = self._total_output_chars
         bytes_written = 0
         try:
             buffer = memoryview(payload)
@@ -1741,6 +1765,7 @@ class SshSession:
             ) from exc
         result = self.read(
             wait_seconds=wait_seconds, max_output_chars=max_output_chars, wait_for_new=True,
+            after_output_chars=output_before_write,
         )
         result["bytes_written"] = bytes_written
         return result
@@ -2006,6 +2031,10 @@ class SshToolService:
         self._configured_rsync_binary = rsync_binary or os.environ.get("SSH_MCP_RSYNC_BIN", "rsync")
         self._configured_tmux_binary = tmux_binary or os.environ.get("SSH_MCP_TMUX_BIN", "tmux")
         self._policy = policy or Policy()
+        # Serialize read-modify-write only for the same remote path. Weak
+        # values release idle locks; running/waiting calls keep a strong ref.
+        self._file_edit_locks_guard = threading.Lock()
+        self._file_edit_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
         self._state_dir = Path(state_dir).expanduser() if state_dir is not None else _default_state_dir()
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._sessions = SessionManager(state_dir=self._state_dir, tmux_binary=self._configured_tmux_binary)
@@ -2282,6 +2311,23 @@ class SshToolService:
         path = _string_argument(validated, "path", required=True)
         edits = _edits_argument(validated)
         timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+        key = (connection.target, connection.port, posixpath.normpath(path))
+        with self._file_edit_locks_guard:
+            edit_lock = self._file_edit_locks.get(key)
+            if edit_lock is None:
+                edit_lock = threading.Lock()
+                self._file_edit_locks[key] = edit_lock
+        with edit_lock:
+            return self._edit_locked(connection, path, edits, timeout=timeout)
+
+    def _edit_locked(
+        self,
+        connection: ConnectionSettings,
+        path: str,
+        edits: list[tuple[str, str]],
+        *,
+        timeout: float | None,
+    ) -> dict[str, Any]:
         shielded_path = _shield_leading_dash(path)
 
         read_result = self._run_remote_script(
@@ -2544,7 +2590,7 @@ class SshToolService:
             auto_close=auto_close,
             mode=mode,
         )
-        result = session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
+        result = session.read(wait_seconds=0 if reused else wait_seconds, max_output_chars=max_output_chars)
         result["created"] = not reused
         result["reused"] = reused
         result["matched_by"] = matched_by
@@ -2564,7 +2610,7 @@ class SshToolService:
             auto_close=auto_close,
             mode=mode,
         )
-        result = session.read(wait_seconds=wait_seconds, max_output_chars=max_output_chars)
+        result = session.read(wait_seconds=0 if reused else wait_seconds, max_output_chars=max_output_chars)
         result["created"] = not reused
         result["reused"] = reused
         result["matched_by"] = matched_by

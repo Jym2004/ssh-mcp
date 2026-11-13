@@ -1171,6 +1171,259 @@ class SshToolServiceTests(unittest.TestCase):
         self.assertLess(elapsed, 0.2)
         self.assertEqual(result["output"], "prefilled-output")
 
+    def test_read_returns_after_new_output_instead_of_waiting_for_timeout(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session = self.service._sessions.get(started["session_id"])
+        with session._condition:
+            session._unread_output = ""
+
+        def emit_output() -> None:
+            with session._condition:
+                session._append_unread_locked("new-output")
+                session._condition.notify_all()
+
+        timer = threading.Timer(0.05, emit_output)
+        timer.start()
+        try:
+            began_at = time.monotonic()
+            result = session.read(wait_seconds=1.0, max_output_chars=4096)
+            elapsed = time.monotonic() - began_at
+        finally:
+            timer.join(timeout=2)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(result["output"], "new-output")
+
+    def test_write_counts_output_that_arrives_before_read_starts(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session = self.service._sessions.get(started["session_id"])
+        with session._condition:
+            session._unread_output = "stale-output:"
+
+        def write_with_immediate_reply(fd: int, payload: memoryview) -> int:
+            with session._condition:
+                session._append_unread_locked("immediate-reply")
+                session._condition.notify_all()
+            return len(payload)
+
+        with mock.patch("ssh_mcp.ssh.os.write", side_effect=write_with_immediate_reply):
+            began_at = time.monotonic()
+            result = session.write(input_text="printf reply\n", wait_seconds=1.0, max_output_chars=4096)
+            elapsed = time.monotonic() - began_at
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(result["output"], "stale-output:immediate-reply")
+
+    def test_wait_for_new_does_not_return_only_stale_output(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session = self.service._sessions.get(started["session_id"])
+        with session._condition:
+            session._unread_output = "stale-output"
+        began_at = time.monotonic()
+        result = session.read(wait_seconds=0.15, max_output_chars=4096, wait_for_new=True)
+        elapsed = time.monotonic() - began_at
+        self.assertGreaterEqual(elapsed, 0.12)
+        self.assertEqual(result["output"], "stale-output")
+
+    def test_reusing_idle_session_does_not_wait_for_output(self) -> None:
+        started = self.service.ssh_ensure_session(
+            {"target": "example", "session_name": "idle-reuse", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session = self.service._sessions.get(started["session_id"])
+        with session._condition:
+            session._unread_output = ""
+        began_at = time.monotonic()
+        reused = self.service.ssh_ensure_session(
+            {"target": "example", "session_name": "idle-reuse", "observer_mode": "transcript", "wait_seconds": 1.0}
+        )
+        elapsed = time.monotonic() - began_at
+        self.assertLess(elapsed, 0.3)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["output"], "")
+
+    def test_read_coalesces_a_burst_and_keeps_later_output_for_next_read(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session = self.service._sessions.get(started["session_id"])
+        with session._condition:
+            session._unread_output = ""
+        late_output = threading.Event()
+
+        def emit(text: str) -> None:
+            with session._condition:
+                session._append_unread_locked(text)
+                session._condition.notify_all()
+            if text == "later":
+                late_output.set()
+
+        timers = [
+            threading.Timer(delay, emit, args=(text,))
+            for delay, text in ((0.05, "first"), (0.07, "-second"), (0.4, "later"))
+        ]
+        for timer in timers:
+            timer.start()
+        try:
+            first = session.read(wait_seconds=1, max_output_chars=4096)
+            self.assertEqual(first["output"], "first-second")
+            self.assertTrue(late_output.wait(timeout=2))
+            second = session.read(wait_seconds=0, max_output_chars=4096)
+            self.assertEqual(second["output"], "later")
+        finally:
+            for timer in timers:
+                timer.join(timeout=2)
+
+    def test_concurrent_session_writes_do_not_overlap_their_readback(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session = self.service._sessions.get(started["session_id"])
+        entered = threading.Event()
+        release = threading.Event()
+        second_attempted = threading.Event()
+        second_entered = threading.Event()
+        errors = []
+
+        def exchange(*, input_text, **kwargs):
+            if input_text == "first":
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise AssertionError("first exchange was not released")
+            else:
+                second_entered.set()
+            return {}
+
+        def write(text):
+            try:
+                if text == "second":
+                    second_attempted.set()
+                session.write(input_text=text, wait_seconds=0.1, max_output_chars=4096)
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(session, "_write_locked", side_effect=exchange):
+            first = threading.Thread(target=write, args=("first",))
+            second = threading.Thread(target=write, args=("second",))
+            first.start()
+            try:
+                self.assertTrue(entered.wait(timeout=1))
+                second.start()
+                self.assertTrue(second_attempted.wait(timeout=1))
+                self.assertFalse(second_entered.wait(timeout=0.1))
+            finally:
+                release.set()
+                first.join(timeout=3)
+                if second.ident is not None:
+                    second.join(timeout=3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(errors, [])
+
+    def test_concurrent_file_edits_preserve_both_changes(self) -> None:
+        target = self.root / "concurrent-edit.txt"
+        target.write_text("first=old\nsecond=old\n", encoding="utf-8")
+        first_read = threading.Event()
+        second_attempted = threading.Event()
+        second_read = threading.Event()
+        release = threading.Event()
+        original = self.service._run_remote_script
+        errors = []
+
+        def run_script(connection, script, args, **kwargs):
+            result = original(connection, script, args, **kwargs)
+            if args[-1] == "read":
+                if not first_read.is_set():
+                    first_read.set()
+                    if not release.wait(timeout=3):
+                        raise AssertionError("first edit was not released")
+                else:
+                    second_read.set()
+            return result
+
+        def edit(key):
+            try:
+                if key == "second":
+                    second_attempted.set()
+                self.service.ssh_edit({"target": "example", "path": str(target), "edits": [
+                    {"old_str": f"{key}=old", "new_str": f"{key}=new"},
+                ]})
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(self.service, "_run_remote_script", side_effect=run_script):
+            first = threading.Thread(target=edit, args=("first",))
+            second = threading.Thread(target=edit, args=("second",))
+            first.start()
+            try:
+                self.assertTrue(first_read.wait(timeout=2))
+                second.start()
+                self.assertTrue(second_attempted.wait(timeout=1))
+                self.assertFalse(second_read.wait(timeout=0.1))
+            finally:
+                release.set()
+                first.join(timeout=4)
+                if second.ident is not None:
+                    second.join(timeout=4)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(target.read_text(encoding="utf-8"), "first=new\nsecond=new\n")
+
+    def test_different_file_edits_can_run_in_parallel(self) -> None:
+        first_path = self.root / "first-file.txt"
+        second_path = self.root / "second-file.txt"
+        for path in (first_path, second_path):
+            path.write_text("old", encoding="utf-8")
+        first_read = threading.Event()
+        second_finished = threading.Event()
+        release_first = threading.Event()
+        original = self.service._run_remote_script
+        errors = []
+
+        def run_script(connection, script, args, **kwargs):
+            result = original(connection, script, args, **kwargs)
+            if args == [str(first_path), "read"]:
+                first_read.set()
+                if not release_first.wait(timeout=4):
+                    raise AssertionError("first edit was not released")
+            return result
+
+        def edit(path):
+            try:
+                self.service.ssh_edit({"target": "example", "path": str(path), "edits": [
+                    {"old_str": "old", "new_str": "new"},
+                ]})
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                if path == second_path:
+                    second_finished.set()
+
+        with mock.patch.object(self.service, "_run_remote_script", side_effect=run_script):
+            first = threading.Thread(target=edit, args=(first_path,))
+            second = threading.Thread(target=edit, args=(second_path,))
+            first.start()
+            try:
+                self.assertTrue(first_read.wait(timeout=2))
+                second.start()
+                self.assertTrue(second_finished.wait(timeout=2))
+                self.assertEqual(second_path.read_text(encoding="utf-8"), "new")
+                self.assertEqual(first_path.read_text(encoding="utf-8"), "old")
+            finally:
+                release_first.set()
+                first.join(timeout=4)
+                if second.ident is not None:
+                    second.join(timeout=4)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(first_path.read_text(encoding="utf-8"), "new")
+
     def test_start_session_falls_back_when_tmux_launch_times_out(self) -> None:
         with mock.patch(
             "ssh_mcp.ssh.subprocess.run",

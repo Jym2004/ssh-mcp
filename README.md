@@ -23,6 +23,8 @@ python3 -m venv .venv
 
 在 MCP 客户端添加本地 stdio 服务：命令指向 `.venv/bin/ssh-mcp-policy`，参数留空。上游工具参数说明见[上游 README](https://github.com/slepp/ssh-mcp)。
 
+短命令优先用 `ssh_exec`。交互会话的 `wait_seconds` 是等待上限：新输出短暂稳定后提前返回；后续输出需继续读取，不代表命令已完成。复用会话立即返回已有输出。独立工具调用可以并发，回复按请求 ID 对应；同一会话的读写会串行，列出会话和 ping 不会排在长工具调用后面。`ssh_edit` 可并行修改不同文件；同一 SSH 目标、端口和路径的编辑会串行，避免互相覆盖。
+
 ## 安全默认值
 
 ```json
